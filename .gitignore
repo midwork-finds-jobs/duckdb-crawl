@@ -1,0 +1,5 @@
+build/
+.cache/
+*.duckdb
+*.wal
+.DS_Store
