@@ -10,6 +10,7 @@
 #include "duckdb/main/appender.hpp"
 #include <set>
 
+#include <algorithm>
 #include <atomic>
 #include <csignal>
 #include <chrono>
@@ -18,6 +19,7 @@
 #include <unordered_map>
 #include <queue>
 #include <deque>
+#include <vector>
 #include <ctime>
 #include <cmath>
 
@@ -311,6 +313,61 @@ static std::string ExtractPath(const std::string &url) {
 	return url.substr(path_start);
 }
 
+// Generate SURT key (Sort-friendly URI Reordering Transform) like Common Crawl
+// Example: https://www.example.com/path?q=1 → com,example,www)/path?q=1
+static std::string GenerateSurtKey(const std::string &url) {
+	// Extract domain
+	size_t proto_end = url.find("://");
+	if (proto_end == std::string::npos) {
+		return url;  // Invalid URL, return as-is
+	}
+	size_t domain_start = proto_end + 3;
+	size_t domain_end = url.find('/', domain_start);
+	if (domain_end == std::string::npos) {
+		domain_end = url.length();
+	}
+
+	std::string domain = url.substr(domain_start, domain_end - domain_start);
+
+	// Remove port if present
+	size_t port_pos = domain.find(':');
+	if (port_pos != std::string::npos) {
+		domain = domain.substr(0, port_pos);
+	}
+
+	// Convert domain to lowercase
+	std::transform(domain.begin(), domain.end(), domain.begin(), ::tolower);
+
+	// Split domain by '.' and reverse
+	std::vector<std::string> parts;
+	size_t pos = 0;
+	size_t prev = 0;
+	while ((pos = domain.find('.', prev)) != std::string::npos) {
+		parts.push_back(domain.substr(prev, pos - prev));
+		prev = pos + 1;
+	}
+	parts.push_back(domain.substr(prev));
+
+	// Build reversed domain with commas
+	std::string surt;
+	for (auto it = parts.rbegin(); it != parts.rend(); ++it) {
+		if (!surt.empty()) {
+			surt += ",";
+		}
+		surt += *it;
+	}
+
+	// Add path (everything after domain)
+	surt += ")";
+	if (domain_end < url.length()) {
+		surt += url.substr(domain_end);
+	} else {
+		surt += "/";
+	}
+
+	return surt;
+}
+
 // Bind data for the crawler function
 struct CrawlerBindData : public TableFunctionData {
 	std::vector<std::string> urls;
@@ -405,6 +462,9 @@ static unique_ptr<FunctionData> CrawlerBind(ClientContext &context, TableFunctio
 
 	// Define output schema
 	names.emplace_back("url");
+	return_types.emplace_back(LogicalType::VARCHAR);
+
+	names.emplace_back("surt_key");
 	return_types.emplace_back(LogicalType::VARCHAR);
 
 	names.emplace_back("domain");
@@ -521,15 +581,17 @@ static void CrawlerFunction(ClientContext &context, TableFunctionInput &data, Da
 
 		if (bind_data.log_skipped) {
 			// Return skipped result
+			std::string surt_key = GenerateSurtKey(url);
 			output.SetCardinality(1);
 			output.SetValue(0, 0, Value(url));
-			output.SetValue(1, 0, Value(domain));
-			output.SetValue(2, 0, Value(-1)); // Special status for robots.txt disallow
-			output.SetValue(3, 0, Value());
+			output.SetValue(1, 0, Value(surt_key));
+			output.SetValue(2, 0, Value(domain));
+			output.SetValue(3, 0, Value(-1)); // Special status for robots.txt disallow
 			output.SetValue(4, 0, Value());
-			output.SetValue(5, 0, Value(0));
-			output.SetValue(6, 0, Value::TIMESTAMP(Timestamp::GetCurrentTimestamp()));
-			output.SetValue(7, 0, Value("robots.txt disallow"));
+			output.SetValue(5, 0, Value());
+			output.SetValue(6, 0, Value(0));
+			output.SetValue(7, 0, Value::TIMESTAMP(Timestamp::GetCurrentTimestamp()));
+			output.SetValue(8, 0, Value("robots.txt disallow"));
 			return;
 		} else {
 			// Skip silently, try next URL
@@ -578,15 +640,17 @@ static void CrawlerFunction(ClientContext &context, TableFunctionInput &data, Da
 	}
 
 	// Return result
+	std::string surt_key = GenerateSurtKey(url);
 	output.SetCardinality(1);
 	output.SetValue(0, 0, Value(url));
-	output.SetValue(1, 0, Value(domain));
-	output.SetValue(2, 0, Value(response.status_code));
-	output.SetValue(3, 0, response.body.empty() ? Value() : Value(response.body));
-	output.SetValue(4, 0, response.content_type.empty() ? Value() : Value(response.content_type));
-	output.SetValue(5, 0, Value(fetch_elapsed_ms));
-	output.SetValue(6, 0, Value::TIMESTAMP(Timestamp::GetCurrentTimestamp()));
-	output.SetValue(7, 0, response.error.empty() ? Value() : Value(response.error));
+	output.SetValue(1, 0, Value(surt_key));
+	output.SetValue(2, 0, Value(domain));
+	output.SetValue(3, 0, Value(response.status_code));
+	output.SetValue(4, 0, response.body.empty() ? Value() : Value(response.body));
+	output.SetValue(5, 0, response.content_type.empty() ? Value() : Value(response.content_type));
+	output.SetValue(6, 0, Value(fetch_elapsed_ms));
+	output.SetValue(7, 0, Value::TIMESTAMP(Timestamp::GetCurrentTimestamp()));
+	output.SetValue(8, 0, response.error.empty() ? Value() : Value(response.error));
 }
 
 void RegisterCrawlerFunction(ExtensionLoader &loader) {
@@ -1178,9 +1242,10 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 		// Check robots.txt rules
 		if (bind_data.respect_robots_txt && !RobotsParser::IsAllowed(domain_state.rules, path)) {
 			if (bind_data.log_skipped) {
+				std::string surt_key = GenerateSurtKey(entry.url);
 				auto insert_sql = "INSERT INTO " + bind_data.target_table +
-				                  " (url, domain, http_status, body, content_type, elapsed_ms, crawled_at, error) VALUES ($1, $2, $3, NULL, NULL, 0, NOW(), $4)";
-				auto insert_result = conn.Query(insert_sql, entry.url, domain, -1, "robots.txt disallow");
+				                  " (url, surt_key, domain, http_status, body, content_type, elapsed_ms, crawled_at, error) VALUES ($1, $2, $3, $4, NULL, NULL, 0, NOW(), $5)";
+				auto insert_result = conn.Query(insert_sql, entry.url, surt_key, domain, -1, "robots.txt disallow");
 				if (!insert_result->HasError()) {
 					rows_changed++;
 				}
@@ -1293,14 +1358,17 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 		std::string validated_date = ParseAndValidateServerDate(response.server_date);
 		std::string timestamp_expr = validated_date.empty() ? "NOW()" : ("'" + validated_date + "'::TIMESTAMP");
 
+		// Generate SURT key for sorting/deduplication
+		std::string surt_key = GenerateSurtKey(entry.url);
+
 		if (entry.is_update) {
-			// UPDATE existing row
+			// UPDATE existing row (surt_key should already exist, but update for consistency)
 			auto update_sql = "UPDATE " + bind_data.target_table +
-			                  " SET domain = $2, http_status = $3, body = $4, content_type = $5, "
-			                  "elapsed_ms = $6, crawled_at = " + timestamp_expr + ", error = $7 "
+			                  " SET surt_key = $2, domain = $3, http_status = $4, body = $5, content_type = $6, "
+			                  "elapsed_ms = $7, crawled_at = " + timestamp_expr + ", error = $8 "
 			                  "WHERE url = $1";
 
-			auto update_result = conn.Query(update_sql, entry.url, domain, response.status_code,
+			auto update_result = conn.Query(update_sql, entry.url, surt_key, domain, response.status_code,
 			                                 response.body.empty() ? Value() : Value(response.body),
 			                                 response.content_type.empty() ? Value() : Value(response.content_type),
 			                                 fetch_elapsed_ms,
@@ -1312,9 +1380,9 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 		} else {
 			// INSERT new row
 			auto insert_sql = "INSERT INTO " + bind_data.target_table +
-			                  " (url, domain, http_status, body, content_type, elapsed_ms, crawled_at, error) VALUES ($1, $2, $3, $4, $5, $6, " + timestamp_expr + ", $7)";
+			                  " (url, surt_key, domain, http_status, body, content_type, elapsed_ms, crawled_at, error) VALUES ($1, $2, $3, $4, $5, $6, $7, " + timestamp_expr + ", $8)";
 
-			auto insert_result = conn.Query(insert_sql, entry.url, domain, response.status_code,
+			auto insert_result = conn.Query(insert_sql, entry.url, surt_key, domain, response.status_code,
 			                                 response.body.empty() ? Value() : Value(response.body),
 			                                 response.content_type.empty() ? Value() : Value(response.content_type),
 			                                 fetch_elapsed_ms,
