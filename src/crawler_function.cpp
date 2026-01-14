@@ -488,6 +488,12 @@ static unique_ptr<FunctionData> CrawlerBind(ClientContext &context, TableFunctio
 	names.emplace_back("error");
 	return_types.emplace_back(LogicalType::VARCHAR);
 
+	names.emplace_back("etag");
+	return_types.emplace_back(LogicalType::VARCHAR);
+
+	names.emplace_back("last_modified");
+	return_types.emplace_back(LogicalType::VARCHAR);
+
 	return std::move(bind_data);
 }
 
@@ -592,6 +598,8 @@ static void CrawlerFunction(ClientContext &context, TableFunctionInput &data, Da
 			output.SetValue(6, 0, Value(0));
 			output.SetValue(7, 0, Value::TIMESTAMP(Timestamp::GetCurrentTimestamp()));
 			output.SetValue(8, 0, Value("robots.txt disallow"));
+			output.SetValue(9, 0, Value());   // etag
+			output.SetValue(10, 0, Value());  // last_modified
 			return;
 		} else {
 			// Skip silently, try next URL
@@ -651,6 +659,8 @@ static void CrawlerFunction(ClientContext &context, TableFunctionInput &data, Da
 	output.SetValue(6, 0, Value(fetch_elapsed_ms));
 	output.SetValue(7, 0, Value::TIMESTAMP(Timestamp::GetCurrentTimestamp()));
 	output.SetValue(8, 0, response.error.empty() ? Value() : Value(response.error));
+	output.SetValue(9, 0, response.etag.empty() ? Value() : Value(response.etag));
+	output.SetValue(10, 0, response.last_modified.empty() ? Value() : Value(response.last_modified));
 }
 
 void RegisterCrawlerFunction(ExtensionLoader &loader) {
@@ -1244,7 +1254,8 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 			if (bind_data.log_skipped) {
 				std::string surt_key = GenerateSurtKey(entry.url);
 				auto insert_sql = "INSERT INTO " + bind_data.target_table +
-				                  " (url, surt_key, domain, http_status, body, content_type, elapsed_ms, crawled_at, error) VALUES ($1, $2, $3, $4, NULL, NULL, 0, NOW(), $5)";
+				                  " (url, surt_key, domain, http_status, body, content_type, elapsed_ms, crawled_at, error, etag, last_modified) "
+				                  "VALUES ($1, $2, $3, $4, NULL, NULL, 0, NOW(), $5, NULL, NULL)";
 				auto insert_result = conn.Query(insert_sql, entry.url, surt_key, domain, -1, "robots.txt disallow");
 				if (!insert_result->HasError()) {
 					rows_changed++;
@@ -1365,14 +1376,17 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 			// UPDATE existing row (surt_key should already exist, but update for consistency)
 			auto update_sql = "UPDATE " + bind_data.target_table +
 			                  " SET surt_key = $2, domain = $3, http_status = $4, body = $5, content_type = $6, "
-			                  "elapsed_ms = $7, crawled_at = " + timestamp_expr + ", error = $8 "
+			                  "elapsed_ms = $7, crawled_at = " + timestamp_expr + ", error = $8, "
+			                  "etag = $9, last_modified = $10 "
 			                  "WHERE url = $1";
 
 			auto update_result = conn.Query(update_sql, entry.url, surt_key, domain, response.status_code,
 			                                 response.body.empty() ? Value() : Value(response.body),
 			                                 response.content_type.empty() ? Value() : Value(response.content_type),
 			                                 fetch_elapsed_ms,
-			                                 response.error.empty() ? Value() : Value(response.error));
+			                                 response.error.empty() ? Value() : Value(response.error),
+			                                 response.etag.empty() ? Value() : Value(response.etag),
+			                                 response.last_modified.empty() ? Value() : Value(response.last_modified));
 
 			if (!update_result->HasError()) {
 				rows_changed++;
@@ -1380,13 +1394,16 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 		} else {
 			// INSERT new row
 			auto insert_sql = "INSERT INTO " + bind_data.target_table +
-			                  " (url, surt_key, domain, http_status, body, content_type, elapsed_ms, crawled_at, error) VALUES ($1, $2, $3, $4, $5, $6, $7, " + timestamp_expr + ", $8)";
+			                  " (url, surt_key, domain, http_status, body, content_type, elapsed_ms, crawled_at, error, etag, last_modified) "
+			                  "VALUES ($1, $2, $3, $4, $5, $6, $7, " + timestamp_expr + ", $8, $9, $10)";
 
 			auto insert_result = conn.Query(insert_sql, entry.url, surt_key, domain, response.status_code,
 			                                 response.body.empty() ? Value() : Value(response.body),
 			                                 response.content_type.empty() ? Value() : Value(response.content_type),
 			                                 fetch_elapsed_ms,
-			                                 response.error.empty() ? Value() : Value(response.error));
+			                                 response.error.empty() ? Value() : Value(response.error),
+			                                 response.etag.empty() ? Value() : Value(response.etag),
+			                                 response.last_modified.empty() ? Value() : Value(response.last_modified));
 
 			if (!insert_result->HasError()) {
 				rows_changed++;

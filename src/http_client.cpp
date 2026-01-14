@@ -38,7 +38,8 @@ int HttpClient::ParseRetryAfter(const std::string &retry_after) {
 }
 
 HttpResponse HttpClient::ExecuteHttpGet(DatabaseInstance &db, const std::string &url,
-                                         const std::string &user_agent, bool compress) {
+                                         const std::string &user_agent, bool compress,
+                                         const std::string &if_none_match, const std::string &if_modified_since) {
 	HttpResponse response;
 
 	Connection conn(db);
@@ -54,26 +55,49 @@ HttpResponse HttpClient::ExecuteHttpGet(DatabaseInstance &db, const std::string 
 	std::string escaped_url = StringUtil::Replace(url, "'", "''");
 
 	// Build headers map
-	std::string headers_map;
-	if (!user_agent.empty() && compress) {
+	std::string headers_map = "{";
+	bool first_header = true;
+
+	if (!user_agent.empty()) {
 		std::string escaped_ua = StringUtil::Replace(user_agent, "'", "''");
-		headers_map = "{'User-Agent': '" + escaped_ua + "', 'Accept-Encoding': 'gzip, deflate'}";
-	} else if (!user_agent.empty()) {
-		std::string escaped_ua = StringUtil::Replace(user_agent, "'", "''");
-		headers_map = "{'User-Agent': '" + escaped_ua + "'}";
-	} else if (compress) {
-		headers_map = "{'Accept-Encoding': 'gzip, deflate'}";
+		headers_map += "'User-Agent': '" + escaped_ua + "'";
+		first_header = false;
 	}
 
-	// Build query - request headers to get Retry-After, Date, and Content-Length
+	if (compress) {
+		if (!first_header) headers_map += ", ";
+		headers_map += "'Accept-Encoding': 'gzip, deflate'";
+		first_header = false;
+	}
+
+	// Add conditional request headers
+	if (!if_none_match.empty()) {
+		if (!first_header) headers_map += ", ";
+		std::string escaped_etag = StringUtil::Replace(if_none_match, "'", "''");
+		headers_map += "'If-None-Match': '" + escaped_etag + "'";
+		first_header = false;
+	}
+
+	if (!if_modified_since.empty()) {
+		if (!first_header) headers_map += ", ";
+		std::string escaped_lm = StringUtil::Replace(if_modified_since, "'", "''");
+		headers_map += "'If-Modified-Since': '" + escaped_lm + "'";
+		first_header = false;
+	}
+
+	headers_map += "}";
+
+	// Build query - request headers to get Retry-After, Date, Content-Length, ETag, Last-Modified
 	std::string query;
-	if (!headers_map.empty()) {
+	if (headers_map != "{}") {
 		query = StringUtil::Format(
 		    "SELECT status, decode(body) AS body, "
 		    "content_type, "
 		    "headers['retry-after'] AS retry_after, "
 		    "headers['Date'] AS server_date, "
-		    "headers['content-length'] AS content_length "
+		    "headers['content-length'] AS content_length, "
+		    "headers['ETag'] AS etag, "
+		    "headers['Last-Modified'] AS last_modified "
 		    "FROM http_get('%s', headers := %s)",
 		    escaped_url, headers_map);
 	} else {
@@ -82,7 +106,9 @@ HttpResponse HttpClient::ExecuteHttpGet(DatabaseInstance &db, const std::string 
 		    "content_type, "
 		    "headers['retry-after'] AS retry_after, "
 		    "headers['Date'] AS server_date, "
-		    "headers['content-length'] AS content_length "
+		    "headers['content-length'] AS content_length, "
+		    "headers['ETag'] AS etag, "
+		    "headers['Last-Modified'] AS last_modified "
 		    "FROM http_get('%s')",
 		    escaped_url);
 	}
@@ -132,16 +158,26 @@ HttpResponse HttpClient::ExecuteHttpGet(DatabaseInstance &db, const std::string 
 		}
 	}
 
-	response.success = (response.status_code >= 200 && response.status_code < 300);
+	// Get ETag
+	auto etag_val = chunk->GetValue(6, 0);
+	response.etag = etag_val.IsNull() ? "" : etag_val.GetValue<std::string>();
+
+	// Get Last-Modified
+	auto lm_val = chunk->GetValue(7, 0);
+	response.last_modified = lm_val.IsNull() ? "" : lm_val.GetValue<std::string>();
+
+	// 304 Not Modified is also considered success for conditional requests
+	response.success = (response.status_code >= 200 && response.status_code < 300) || response.status_code == 304;
 	return response;
 }
 
 HttpResponse HttpClient::Fetch(ClientContext &context, const std::string &url, const RetryConfig &config,
-                               const std::string &user_agent, bool compress) {
+                               const std::string &user_agent, bool compress,
+                               const std::string &if_none_match, const std::string &if_modified_since) {
 	auto &db = DatabaseInstance::GetDatabase(context);
 
 	// Single attempt - crawler handles all retries with Fibonacci backoff
-	return ExecuteHttpGet(db, url, user_agent, compress);
+	return ExecuteHttpGet(db, url, user_agent, compress, if_none_match, if_modified_since);
 }
 
 } // namespace duckdb
