@@ -180,4 +180,11 @@ HttpResponse HttpClient::Fetch(ClientContext &context, const std::string &url, c
 	return ExecuteHttpGet(db, url, user_agent, compress, if_none_match, if_modified_since);
 }
 
+HttpResponse HttpClient::Fetch(DatabaseInstance &db, const std::string &url, const RetryConfig &config,
+                               const std::string &user_agent, bool compress,
+                               const std::string &if_none_match, const std::string &if_modified_since) {
+	// Thread-safe overload - ExecuteHttpGet creates its own Connection
+	return ExecuteHttpGet(db, url, user_agent, compress, if_none_match, if_modified_since);
+}
+
 } // namespace duckdb

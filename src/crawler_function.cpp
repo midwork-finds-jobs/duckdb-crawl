@@ -23,6 +23,7 @@
 #include <vector>
 #include <ctime>
 #include <cmath>
+#include <future>
 
 namespace duckdb {
 
@@ -1264,6 +1265,113 @@ static void GetLatestProgress(Connection &conn, const std::string &target_table,
 	bytes_downloaded = 0;
 }
 
+// Result from parallel sitemap discovery
+struct SitemapDiscoveryResult {
+	std::string hostname;
+	std::vector<std::string> urls;
+	DomainState domain_state;
+};
+
+// Thread-safe sitemap discovery for parallel execution
+static SitemapDiscoveryResult DiscoverSitemapUrlsThreadSafe(DatabaseInstance &db,
+                                                             const std::string &hostname,
+                                                             const std::string &user_agent,
+                                                             double default_crawl_delay, double cache_hours) {
+	SitemapDiscoveryResult result;
+	result.hostname = hostname;
+	result.domain_state.crawl_delay_seconds = default_crawl_delay;
+	result.domain_state.min_crawl_delay_seconds = default_crawl_delay;
+
+	// Create own connection for thread safety
+	Connection conn(db);
+
+	// Check cache first
+	EnsureSitemapCacheTable(conn);
+	auto cached_urls = GetCachedSitemapUrls(conn, hostname, cache_hours);
+	if (!cached_urls.empty()) {
+		result.urls = cached_urls;
+		return result;
+	}
+
+	// No valid cache - discover sitemaps
+	std::vector<SitemapEntry> sitemap_entries;
+	std::set<std::string> processed_sitemaps;
+	std::vector<std::string> to_process;
+
+	RetryConfig retry_config;
+	retry_config.max_retries = 2;
+
+	// Step 1: Try robots.txt for Sitemap directives
+	std::string robots_url = "https://" + hostname + "/robots.txt";
+	auto robots_response = HttpClient::Fetch(db, robots_url, retry_config, user_agent);
+
+	if (robots_response.success) {
+		auto sitemaps_from_robots = SitemapParser::ExtractSitemapsFromRobotsTxt(robots_response.body);
+		for (auto &sm : sitemaps_from_robots) {
+			to_process.push_back(sm);
+		}
+
+		// Parse robots rules for rate limiting
+		auto robots_data = RobotsParser::Parse(robots_response.body);
+		result.domain_state.rules = RobotsParser::GetRulesForUserAgent(robots_data, user_agent);
+		result.domain_state.has_crawl_delay = result.domain_state.rules.HasCrawlDelay();
+		if (result.domain_state.has_crawl_delay) {
+			result.domain_state.crawl_delay_seconds = result.domain_state.rules.GetEffectiveDelay();
+		}
+		result.domain_state.min_crawl_delay_seconds = result.domain_state.crawl_delay_seconds;
+		result.domain_state.robots_fetched = true;
+	}
+
+	// Step 2: If no sitemaps found, bruteforce common locations
+	if (to_process.empty()) {
+		auto common_paths = SitemapParser::GetCommonSitemapPaths();
+		for (auto &path : common_paths) {
+			to_process.push_back("https://" + hostname + path);
+		}
+	}
+
+	// Step 3: Fetch and parse sitemaps (handle sitemap indexes recursively)
+	while (!to_process.empty() && !g_shutdown_requested) {
+		std::string sitemap_url = to_process.back();
+		to_process.pop_back();
+
+		if (processed_sitemaps.count(sitemap_url)) {
+			continue;
+		}
+		processed_sitemaps.insert(sitemap_url);
+
+		auto response = HttpClient::Fetch(db, sitemap_url, retry_config, user_agent);
+		if (!response.success || response.status_code != 200) {
+			continue;
+		}
+
+		auto sitemap_data = SitemapParser::Parse(response.body);
+
+		if (sitemap_data.is_index) {
+			for (auto &nested_url : sitemap_data.sitemap_urls) {
+				if (!processed_sitemaps.count(nested_url)) {
+					to_process.push_back(nested_url);
+				}
+			}
+		} else {
+			for (auto &entry : sitemap_data.urls) {
+				sitemap_entries.push_back(entry);
+			}
+		}
+	}
+
+	// Cache discovered entries
+	if (!sitemap_entries.empty()) {
+		CacheSitemapUrls(conn, hostname, sitemap_entries);
+	}
+
+	// Return just URLs
+	for (const auto &entry : sitemap_entries) {
+		result.urls.push_back(entry.loc);
+	}
+	return result;
+}
+
 // Helper: Discover sitemaps for a hostname (with caching)
 static std::vector<std::string> DiscoverSitemapUrls(ClientContext &context, Connection &conn,
                                                      const std::string &hostname,
@@ -1418,18 +1526,43 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 	std::vector<std::string> urls;
 
 	if (bind_data.crawl_mode == 1) {  // SITES mode
-		// source_values are hostnames - discover sitemaps and extract URLs
-		for (const auto &hostname : source_values) {
-			if (g_shutdown_requested) {
-				break;
+		// source_values are hostnames - discover sitemaps in parallel
+		auto &db = DatabaseInstance::GetDatabase(context);
+
+		// Limit parallel discovery to max_parallel_per_domain (or 8 if not set)
+		int max_parallel = std::min((int)source_values.size(), bind_data.max_parallel_per_domain);
+		if (max_parallel < 1) max_parallel = 8;
+
+		std::vector<std::future<SitemapDiscoveryResult>> futures;
+		std::vector<SitemapDiscoveryResult> results;
+
+		size_t idx = 0;
+		while (idx < source_values.size() && !g_shutdown_requested) {
+			// Launch batch of async tasks
+			futures.clear();
+			for (int i = 0; i < max_parallel && idx < source_values.size(); i++, idx++) {
+				const auto &hostname = source_values[idx];
+				futures.push_back(std::async(std::launch::async,
+				    DiscoverSitemapUrlsThreadSafe,
+				    std::ref(db), hostname, bind_data.user_agent,
+				    bind_data.default_crawl_delay, bind_data.sitemap_cache_hours));
 			}
 
-			auto discovered_urls = DiscoverSitemapUrls(context, conn, hostname, bind_data.user_agent,
-			                                           domain_states, bind_data.default_crawl_delay,
-			                                           bind_data.sitemap_cache_hours);
+			// Collect results from this batch
+			for (auto &f : futures) {
+				if (g_shutdown_requested) break;
+				try {
+					results.push_back(f.get());
+				} catch (...) {
+					// Silently skip failed discoveries
+				}
+			}
+		}
 
-			// Apply URL filter if specified
-			for (const auto &url : discovered_urls) {
+		// Merge results into domain_states and urls
+		for (auto &res : results) {
+			domain_states[res.hostname] = res.domain_state;
+			for (const auto &url : res.urls) {
 				if (bind_data.url_filter.empty() || MatchesLikePattern(url, bind_data.url_filter)) {
 					urls.push_back(url);
 				}

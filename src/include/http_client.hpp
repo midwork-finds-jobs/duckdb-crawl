@@ -31,6 +31,10 @@ public:
 	static HttpResponse Fetch(ClientContext &context, const std::string &url, const RetryConfig &config,
 	                          const std::string &user_agent = "", bool compress = true,
 	                          const std::string &if_none_match = "", const std::string &if_modified_since = "");
+	// Thread-safe overload that creates its own Connection - for parallel operations
+	static HttpResponse Fetch(DatabaseInstance &db, const std::string &url, const RetryConfig &config,
+	                          const std::string &user_agent = "", bool compress = true,
+	                          const std::string &if_none_match = "", const std::string &if_modified_since = "");
 	static int ParseRetryAfter(const std::string &retry_after);
 
 private:
