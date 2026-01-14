@@ -130,14 +130,23 @@ struct DomainState {
 	int active_requests = 0;
 };
 
-// URL queue entry with retry tracking
+// URL queue entry with retry tracking and scheduling
 struct UrlQueueEntry {
 	std::string url;
 	int retry_count;
 	bool is_update;
+	std::chrono::steady_clock::time_point earliest_fetch;
 
 	UrlQueueEntry(const std::string &u, int rc, bool upd)
-	    : url(u), retry_count(rc), is_update(upd) {}
+	    : url(u), retry_count(rc), is_update(upd), earliest_fetch(std::chrono::steady_clock::now()) {}
+
+	UrlQueueEntry(const std::string &u, int rc, bool upd, std::chrono::steady_clock::time_point ef)
+	    : url(u), retry_count(rc), is_update(upd), earliest_fetch(ef) {}
+
+	// For priority queue: earlier times have higher priority
+	bool operator>(const UrlQueueEntry &other) const {
+		return earliest_fetch > other.earliest_fetch;
+	}
 };
 
 // Fibonacci backoff: 3, 3, 6, 9, 15, 24, 39, 63, 102, 165, 267...
@@ -1024,17 +1033,19 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 		}
 	}
 
-	// Build URL queue: new URLs first, then stale URLs (if update_stale enabled)
-	std::deque<UrlQueueEntry> url_queue;
+	// Build URL priority queue: sorted by earliest_fetch time
+	// Using greater<> so earliest times come first (min-heap)
+	std::priority_queue<UrlQueueEntry, std::vector<UrlQueueEntry>, std::greater<UrlQueueEntry>> url_queue;
 
+	auto now = std::chrono::steady_clock::now();
 	for (const auto &url : urls) {
 		if (existing_urls.find(url) == existing_urls.end()) {
-			// New URL - add first (priority)
-			url_queue.push_back({url, 0, false});
+			// New URL - can be fetched immediately
+			url_queue.push(UrlQueueEntry(url, 0, false, now));
 		}
 	}
 
-	// If update_stale enabled, check existing URLs for staleness and add them after new URLs
+	// If update_stale enabled, check existing URLs for staleness and add them
 	if (bind_data.update_stale && !existing_urls.empty()) {
 		// Ensure sitemap cache exists for staleness checks
 		EnsureSitemapCacheTable(conn);
@@ -1043,7 +1054,7 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 			if (existing_urls.find(url) != existing_urls.end()) {
 				// Existing URL - check if stale
 				if (IsUrlStale(conn, url, bind_data.target_table)) {
-					url_queue.push_back({url, 0, true});  // is_update = true
+					url_queue.push(UrlQueueEntry(url, 0, true, now));  // is_update = true
 				}
 			}
 		}
@@ -1057,10 +1068,25 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 
 	int64_t rows_changed = 0;
 
-	// Process URL queue with retry logic
+	// Process URL priority queue with retry logic
 	while (!url_queue.empty() && !g_shutdown_requested) {
-		auto entry = url_queue.front();
-		url_queue.pop_front();
+		auto entry = url_queue.top();
+		url_queue.pop();
+
+		// Wait if the entry's earliest fetch time is in the future
+		auto now = std::chrono::steady_clock::now();
+		if (entry.earliest_fetch > now) {
+			auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+			    entry.earliest_fetch - now).count();
+			if (wait_ms > 0 && wait_ms < 60000) {  // Wait max 60s at a time
+				std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
+			}
+			now = std::chrono::steady_clock::now();
+		}
+
+		if (g_shutdown_requested) {
+			break;
+		}
 
 		std::string domain = ExtractDomain(entry.url);
 		std::string path = ExtractPath(entry.url);
@@ -1068,20 +1094,12 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 		auto &domain_state = domain_states[domain];
 
 		// Check if domain is blocked (429/5XX backoff)
-		auto now = std::chrono::steady_clock::now();
 		if (domain_state.blocked_until > now) {
-			// Domain is blocked - re-queue if under retry limit
+			// Domain is blocked - re-queue with updated earliest_fetch if under retry limit
 			if (entry.retry_count < 5) {
 				entry.retry_count++;
-				url_queue.push_back(entry);
-			}
-			// If we've only got blocked URLs left, wait for the shortest block to expire
-			if (url_queue.size() == 1 || (url_queue.empty() && entry.retry_count < 5)) {
-				auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-				    domain_state.blocked_until - now).count();
-				if (wait_ms > 0 && wait_ms < 60000) {  // Wait max 60s at a time
-					std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
-				}
+				entry.earliest_fetch = domain_state.blocked_until;
+				url_queue.push(entry);
 			}
 			continue;
 		}
@@ -1132,7 +1150,9 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 		// Check parallel limit for domains without crawl-delay
 		if (!domain_state.has_crawl_delay) {
 			if (domain_state.active_requests >= bind_data.max_parallel_per_domain) {
-				url_queue.push_back(entry);  // Re-queue, try later
+				// Re-queue with small delay to let other domains proceed
+				entry.earliest_fetch = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+				url_queue.push(entry);
 				continue;
 			}
 			domain_state.active_requests++;
@@ -1218,7 +1238,8 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 			// Re-queue URL if under retry limit
 			if (entry.retry_count < 5) {
 				entry.retry_count++;
-				url_queue.push_back(entry);
+				entry.earliest_fetch = domain_state.blocked_until;  // Schedule after backoff
+				url_queue.push(entry);
 			}
 			continue;
 		}
