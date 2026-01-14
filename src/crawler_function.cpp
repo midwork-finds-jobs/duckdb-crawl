@@ -979,6 +979,75 @@ static void CacheSitemapUrls(Connection &conn, const std::string &hostname,
 	}
 }
 
+//===--------------------------------------------------------------------===//
+// Persistent Queue for Crash Recovery
+//===--------------------------------------------------------------------===//
+
+// Ensure crawl queue table exists
+static void EnsureCrawlQueueTable(Connection &conn, const std::string &target_table) {
+	std::string queue_table = "_crawl_queue_" + target_table;
+	conn.Query("CREATE TABLE IF NOT EXISTS \"" + queue_table + "\" ("
+	           "url VARCHAR PRIMARY KEY, "
+	           "retry_count INTEGER DEFAULT 0, "
+	           "is_update BOOLEAN DEFAULT FALSE, "
+	           "domain VARCHAR, "
+	           "added_at TIMESTAMP DEFAULT NOW())");
+}
+
+// Add URLs to persistent queue
+static void AddToQueue(Connection &conn, const std::string &target_table,
+                       const std::vector<std::string> &urls, const std::string &domain, bool is_update) {
+	std::string queue_table = "_crawl_queue_" + target_table;
+	for (const auto &url : urls) {
+		conn.Query("INSERT OR IGNORE INTO \"" + queue_table + "\" (url, domain, is_update) VALUES ($1, $2, $3)",
+		           url, domain, is_update);
+	}
+}
+
+// Remove URL from queue after successful processing
+static void RemoveFromQueue(Connection &conn, const std::string &target_table, const std::string &url) {
+	std::string queue_table = "_crawl_queue_" + target_table;
+	conn.Query("DELETE FROM \"" + queue_table + "\" WHERE url = $1", url);
+}
+
+// Load pending URLs from queue (for resume after crash)
+static std::vector<UrlQueueEntry> LoadQueuedUrls(Connection &conn, const std::string &target_table) {
+	std::vector<UrlQueueEntry> entries;
+	std::string queue_table = "_crawl_queue_" + target_table;
+
+	auto result = conn.Query("SELECT url, retry_count, is_update FROM \"" + queue_table + "\" ORDER BY added_at");
+	if (!result->HasError()) {
+		auto now = std::chrono::steady_clock::now();
+		while (auto chunk = result->Fetch()) {
+			for (idx_t i = 0; i < chunk->size(); i++) {
+				auto url_val = chunk->GetValue(0, i);
+				auto retry_val = chunk->GetValue(1, i);
+				auto update_val = chunk->GetValue(2, i);
+				if (!url_val.IsNull()) {
+					std::string url = StringValue::Get(url_val);
+					int retry = retry_val.IsNull() ? 0 : retry_val.GetValue<int>();
+					bool is_update = !update_val.IsNull() && update_val.GetValue<bool>();
+					entries.push_back(UrlQueueEntry(url, retry, is_update, now));
+				}
+			}
+		}
+	}
+	return entries;
+}
+
+// Get queue size
+static int64_t GetQueueSize(Connection &conn, const std::string &target_table) {
+	std::string queue_table = "_crawl_queue_" + target_table;
+	auto result = conn.Query("SELECT COUNT(*) FROM \"" + queue_table + "\"");
+	if (!result->HasError()) {
+		auto chunk = result->Fetch();
+		if (chunk && chunk->size() > 0) {
+			return chunk->GetValue(0, 0).GetValue<int64_t>();
+		}
+	}
+	return 0;
+}
+
 // Helper: Discover sitemaps for a hostname (with caching)
 static std::vector<std::string> DiscoverSitemapUrls(ClientContext &context, Connection &conn,
                                                      const std::string &hostname,
@@ -1118,6 +1187,13 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 	// Prepare domain states for rate limiting
 	std::unordered_map<std::string, DomainState> domain_states;
 
+	// Initialize persistent queue for crash recovery
+	EnsureCrawlQueueTable(conn, bind_data.target_table);
+
+	// Check for existing queued URLs (resume from previous run)
+	auto queued_entries = LoadQueuedUrls(conn, bind_data.target_table);
+	bool is_resume = !queued_entries.empty();
+
 	// Determine URLs to crawl based on mode
 	std::vector<std::string> urls;
 
@@ -1169,25 +1245,57 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 	std::priority_queue<UrlQueueEntry, std::vector<UrlQueueEntry>, std::greater<UrlQueueEntry>> url_queue;
 
 	auto now = std::chrono::steady_clock::now();
-	for (const auto &url : urls) {
-		if (existing_urls.find(url) == existing_urls.end()) {
-			// New URL - can be fetched immediately
-			url_queue.push(UrlQueueEntry(url, 0, false, now));
-		}
-	}
 
-	// If update_stale enabled, check existing URLs for staleness and add them
-	if (bind_data.update_stale && !existing_urls.empty()) {
-		// Ensure sitemap cache exists for staleness checks
-		EnsureSitemapCacheTable(conn);
+	if (is_resume) {
+		// Resume mode: load queued entries directly
+		for (auto &entry : queued_entries) {
+			url_queue.push(std::move(entry));
+		}
+	} else {
+		// Fresh start: build queue from discovered URLs
+		std::vector<std::string> new_urls_to_queue;
+		std::vector<std::string> update_urls_to_queue;
 
 		for (const auto &url : urls) {
-			if (existing_urls.find(url) != existing_urls.end()) {
-				// Existing URL - check if stale
-				if (IsUrlStale(conn, url, bind_data.target_table)) {
-					url_queue.push(UrlQueueEntry(url, 0, true, now));  // is_update = true
+			if (existing_urls.find(url) == existing_urls.end()) {
+				// New URL - can be fetched immediately
+				url_queue.push(UrlQueueEntry(url, 0, false, now));
+				new_urls_to_queue.push_back(url);
+			}
+		}
+
+		// If update_stale enabled, check existing URLs for staleness and add them
+		if (bind_data.update_stale && !existing_urls.empty()) {
+			// Ensure sitemap cache exists for staleness checks
+			EnsureSitemapCacheTable(conn);
+
+			for (const auto &url : urls) {
+				if (existing_urls.find(url) != existing_urls.end()) {
+					// Existing URL - check if stale
+					if (IsUrlStale(conn, url, bind_data.target_table)) {
+						url_queue.push(UrlQueueEntry(url, 0, true, now));  // is_update = true
+						update_urls_to_queue.push_back(url);
+					}
 				}
 			}
+		}
+
+		// Persist queue to database for crash recovery (grouped by domain)
+		std::unordered_map<std::string, std::vector<std::string>> new_by_domain;
+		std::unordered_map<std::string, std::vector<std::string>> update_by_domain;
+
+		for (const auto &url : new_urls_to_queue) {
+			new_by_domain[ExtractDomain(url)].push_back(url);
+		}
+		for (const auto &url : update_urls_to_queue) {
+			update_by_domain[ExtractDomain(url)].push_back(url);
+		}
+
+		for (const auto &pair : new_by_domain) {
+			AddToQueue(conn, bind_data.target_table, pair.second, pair.first, false);
+		}
+		for (const auto &pair : update_by_domain) {
+			AddToQueue(conn, bind_data.target_table, pair.second, pair.first, true);
 		}
 	}
 
@@ -1278,7 +1386,11 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 				auto insert_result = conn.Query(insert_sql, entry.url, surt_key, domain, -1, "robots.txt disallow");
 				if (!insert_result->HasError()) {
 					rows_changed++;
+					RemoveFromQueue(conn, bind_data.target_table, entry.url);
 				}
+			} else {
+				// Not logging, still remove from queue
+				RemoveFromQueue(conn, bind_data.target_table, entry.url);
 			}
 			continue;
 		}
@@ -1411,6 +1523,7 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 
 			if (!update_result->HasError()) {
 				rows_changed++;
+				RemoveFromQueue(conn, bind_data.target_table, entry.url);
 			}
 		} else {
 			// INSERT new row
@@ -1429,6 +1542,7 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 
 			if (!insert_result->HasError()) {
 				rows_changed++;
+				RemoveFromQueue(conn, bind_data.target_table, entry.url);
 			}
 		}
 	}
