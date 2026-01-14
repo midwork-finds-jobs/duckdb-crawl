@@ -128,6 +128,11 @@ struct DomainState {
 
 	// Parallel tracking
 	int active_requests = 0;
+
+	// Adaptive rate limiting
+	double average_response_ms = 0;  // Exponential moving average
+	double min_crawl_delay_seconds = 0;  // Floor from robots.txt or default
+	int response_count = 0;  // Number of responses for EMA warmup
 };
 
 // URL queue entry with retry tracking and scheduling
@@ -160,6 +165,33 @@ static int FibonacciBackoffSeconds(int n, int max_seconds) {
 		if (b > max_seconds) return max_seconds;
 	}
 	return std::min(b, max_seconds);
+}
+
+// Adaptive rate limiting: adjust delay based on response times
+// Uses exponential moving average (EMA) with alpha=0.2
+static void UpdateAdaptiveDelay(DomainState &state, double response_ms, double max_delay) {
+	// Update EMA (alpha=0.2 for smoothing)
+	constexpr double alpha = 0.2;
+	if (state.response_count == 0) {
+		state.average_response_ms = response_ms;
+	} else {
+		state.average_response_ms = alpha * response_ms + (1.0 - alpha) * state.average_response_ms;
+	}
+	state.response_count++;
+
+	// Need at least 3 samples before adapting
+	if (state.response_count < 3) {
+		return;
+	}
+
+	// If response is significantly slower than average, increase delay
+	if (response_ms > 2.0 * state.average_response_ms) {
+		state.crawl_delay_seconds = std::min(state.crawl_delay_seconds * 1.5, max_delay);
+	}
+	// If response is significantly faster than average, decrease delay (but respect floor)
+	else if (response_ms < 0.5 * state.average_response_ms) {
+		state.crawl_delay_seconds = std::max(state.crawl_delay_seconds * 0.9, state.min_crawl_delay_seconds);
+	}
 }
 
 // Parse HTTP date format: "Tue, 14 Jan 2025 12:00:00 GMT"
@@ -471,9 +503,12 @@ static void CrawlerFunction(ClientContext &context, TableFunctionInput &data, Da
 			// Clamp to min/max
 			domain_state.crawl_delay_seconds = std::max(domain_state.crawl_delay_seconds, bind_data.min_crawl_delay);
 			domain_state.crawl_delay_seconds = std::min(domain_state.crawl_delay_seconds, bind_data.max_crawl_delay);
+			// Set floor for adaptive rate limiting
+			domain_state.min_crawl_delay_seconds = domain_state.crawl_delay_seconds;
 		} else {
 			// robots.txt not found or error - use default delay, allow all
 			domain_state.crawl_delay_seconds = bind_data.default_crawl_delay;
+			domain_state.min_crawl_delay_seconds = bind_data.default_crawl_delay;
 		}
 
 		domain_state.robots_fetched = true;
@@ -886,11 +921,14 @@ static std::vector<std::string> DiscoverSitemapUrls(ClientContext &context, Conn
 		auto &domain_state = domain_states[hostname];
 		auto robots_data = RobotsParser::Parse(robots_response.body);
 		domain_state.rules = RobotsParser::GetRulesForUserAgent(robots_data, user_agent);
-		if (domain_state.rules.HasCrawlDelay()) {
+		domain_state.has_crawl_delay = domain_state.rules.HasCrawlDelay();
+		if (domain_state.has_crawl_delay) {
 			domain_state.crawl_delay_seconds = domain_state.rules.crawl_delay;
 		} else {
 			domain_state.crawl_delay_seconds = default_crawl_delay;
 		}
+		// Set floor for adaptive rate limiting
+		domain_state.min_crawl_delay_seconds = domain_state.crawl_delay_seconds;
 		domain_state.robots_fetched = true;
 	}
 
@@ -1126,8 +1164,11 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 
 				domain_state.crawl_delay_seconds = std::max(domain_state.crawl_delay_seconds, bind_data.min_crawl_delay);
 				domain_state.crawl_delay_seconds = std::min(domain_state.crawl_delay_seconds, bind_data.max_crawl_delay);
+				// Set floor for adaptive rate limiting
+				domain_state.min_crawl_delay_seconds = domain_state.crawl_delay_seconds;
 			} else {
 				domain_state.crawl_delay_seconds = bind_data.default_crawl_delay;
+				domain_state.min_crawl_delay_seconds = bind_data.default_crawl_delay;
 				domain_state.has_crawl_delay = false;  // No robots.txt = allow parallel
 			}
 
@@ -1244,8 +1285,9 @@ static void CrawlIntoFunction(ClientContext &context, TableFunctionInput &data, 
 			continue;
 		}
 
-		// Success - clear consecutive error count
+		// Success - clear consecutive error count and update adaptive delay
 		domain_state.consecutive_429s = 0;
+		UpdateAdaptiveDelay(domain_state, static_cast<double>(fetch_elapsed_ms), bind_data.max_crawl_delay);
 
 		// Get timestamp - prefer server Date header if valid (within 15 min of local time)
 		std::string validated_date = ParseAndValidateServerDate(response.server_date);
