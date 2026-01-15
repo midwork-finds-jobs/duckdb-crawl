@@ -2,6 +2,36 @@
 
 **See also:** [REQUIREMENTS.md](REQUIREMENTS.md) for behavioral requirements (rate limiting, 429 handling, robots.txt compliance, etc.)
 
+## Code Organization Guidelines
+
+### File Size Limits
+- **Max ~500 lines per file** - if approaching this, plan to split
+- **Max ~100 lines per function** - extract helpers if longer
+- Files over 1000 lines MUST be refactored before adding more code
+
+### When to Refactor
+Before adding new features to a large file, split it first:
+1. Identify cohesive groups (e.g., thread utils, HTTP handling, parsing)
+2. Extract to new `.cpp/.hpp` files
+3. Update `CMakeLists.txt` to include new sources
+4. Then add the new feature
+
+### Suggested Structure
+```
+src/
+├── crawler_extension.cpp  # Entry point, registration only
+├── crawler_function.cpp   # Table function binding, main orchestration
+├── crawler_worker.cpp     # CrawlWorker thread logic
+├── thread_utils.cpp       # ThreadSafeQueue, ThreadSafeDomainMap
+├── sitemap_discovery.cpp  # Sitemap fetching/caching
+├── utils.cpp              # DecompressGzip, GenerateSurtKey, helpers
+├── http_client.cpp        # HTTP via libcurl
+├── robots_parser.cpp      # robots.txt parsing
+├── sitemap_parser.cpp     # XML sitemap parsing
+├── link_parser.cpp        # HTML link extraction
+└── include/               # Headers
+```
+
 ## Build Commands
 
 ```bash
@@ -217,7 +247,11 @@ if (response.body.size() > max_response_bytes) {
 |------|---------|
 | `src/crawler_extension.cpp` | Extension entry, registers parser & functions |
 | `src/crawl_parser.cpp` | CRAWL syntax parsing (INTO, WHERE, WITH) |
-| `src/crawler_function.cpp` | Main crawl logic, table function impl |
+| `src/crawler_function.cpp` | Table function binding, main orchestration |
+| `src/crawler_worker.cpp` | CrawlWorker thread logic (TODO: extract) |
+| `src/thread_utils.cpp` | ThreadSafeQueue, ThreadSafeDomainMap (TODO: extract) |
+| `src/sitemap_discovery.cpp` | Sitemap fetching/caching (TODO: extract) |
+| `src/utils.cpp` | Helpers: DecompressGzip, GenerateSurtKey (TODO: extract) |
 | `src/http_client.cpp` | HTTP requests via libcurl |
 | `src/robots_parser.cpp` | robots.txt parsing |
 | `src/sitemap_parser.cpp` | Sitemap XML parsing |
