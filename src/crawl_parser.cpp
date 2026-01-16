@@ -317,11 +317,55 @@ ParserExtensionParseResult CrawlParserExtension::ParseCrawl(ParserExtensionInfo 
 		}
 	}
 
+	// Find LIMIT position (can be after WITH or after table name)
+	size_t limit_pos = after_into_lower.find("limit");
+
 	// Parse WITH clause if present
 	if (with_pos != string::npos) {
-		string with_clause = Trim(after_into.substr(with_pos + 4));
-		if (!ParseWithOptions(with_clause, *data)) {
-			return ParserExtensionParseResult("CRAWL syntax error: invalid WITH clause");
+		string after_with = after_into.substr(with_pos + 4);
+		string after_with_trimmed = Trim(after_with);
+
+		// Find the end of WITH (...) - need to match parentheses
+		if (!after_with_trimmed.empty() && after_with_trimmed.front() == '(') {
+			size_t with_paren_end = FindClosingParen(after_with_trimmed, 0);
+			if (with_paren_end != string::npos) {
+				string with_content = after_with_trimmed.substr(0, with_paren_end + 1);
+				if (!ParseWithOptions(with_content, *data)) {
+					return ParserExtensionParseResult("CRAWL syntax error: invalid WITH clause");
+				}
+			} else {
+				return ParserExtensionParseResult("CRAWL syntax error: unmatched parenthesis in WITH clause");
+			}
+		} else {
+			// WITH without parentheses - parse until LIMIT or end
+			string with_content;
+			if (limit_pos != string::npos && limit_pos > with_pos) {
+				with_content = Trim(after_into.substr(with_pos + 4, limit_pos - with_pos - 4));
+			} else {
+				with_content = after_with_trimmed;
+			}
+			if (!ParseWithOptions(with_content, *data)) {
+				return ParserExtensionParseResult("CRAWL syntax error: invalid WITH clause");
+			}
+		}
+	}
+
+	// Parse LIMIT clause if present - sets max_crawl_pages
+	if (limit_pos != string::npos) {
+		string after_limit = Trim(after_into.substr(limit_pos + 5)); // skip "limit"
+		// Remove trailing semicolon
+		if (!after_limit.empty() && after_limit.back() == ';') {
+			after_limit.pop_back();
+			after_limit = Trim(after_limit);
+		}
+		// Parse the number
+		try {
+			int limit_value = std::stoi(after_limit);
+			if (limit_value > 0) {
+				data->max_crawl_pages = limit_value;
+			}
+		} catch (...) {
+			return ParserExtensionParseResult("CRAWL syntax error: LIMIT must be followed by a positive integer");
 		}
 	}
 

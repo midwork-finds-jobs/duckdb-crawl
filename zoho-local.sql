@@ -8,9 +8,9 @@ LOAD 'build/release/extension/crawler/crawler.duckdb_extension';
 INSTALL json;
 LOAD json;
 
--- Crawl the local zoho career page
+-- Crawl the local zoho career page (LIMIT is pushed down to crawler)
 CRAWL (SELECT 'http://localhost:48765/zoho-career.html') INTO zoho_raw
-WITH (user_agent 'TestBot/1.0', max_crawl_pages 1);
+WITH (user_agent 'TestBot/1.0') LIMIT 1;
 
 -- Extract job postings from the js column
 -- The jobs variable contains a JSON array of job objects

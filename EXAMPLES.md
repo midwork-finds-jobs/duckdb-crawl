@@ -8,9 +8,9 @@
 -- Load extension (if not auto-loaded)
 LOAD 'build/release/extension/crawler/crawler.duckdb_extension';
 
--- Crawl a site into a table
+-- Crawl a site into a table (LIMIT is pushed down to crawler)
 CRAWL (SELECT 'https://example.com/') INTO pages
-WITH (user_agent 'MyBot/1.0', max_crawl_pages 100);
+WITH (user_agent 'MyBot/1.0') LIMIT 100;
 
 -- View results
 SELECT url, http_status, content_type FROM pages LIMIT 10;
@@ -20,7 +20,17 @@ SELECT url, http_status, content_type FROM pages LIMIT 10;
 
 ```sql
 CRAWL (SELECT 'http://localhost:8080/test.html') INTO test_pages
-WITH (user_agent 'TestBot/1.0', max_crawl_pages 1);
+WITH (user_agent 'TestBot/1.0') LIMIT 1;
+```
+
+### LIMIT pushdown
+
+The `LIMIT N` clause is pushed down to the crawler, stopping after N pages:
+
+```sql
+-- These are equivalent:
+CRAWL (SELECT 'https://example.com/') INTO pages WITH (user_agent 'Bot/1.0') LIMIT 50;
+CRAWL (SELECT 'https://example.com/') INTO pages WITH (user_agent 'Bot/1.0', max_crawl_pages 50);
 ```
 
 ## Result Table Schema
