@@ -49,15 +49,7 @@ Would need to bypass vcpkg for TLS libs.
 
 ## Current Issues
 
-### 1. Upstream DuckDB: HTTP Header Length (Blocker)
-**Status**: Waiting for upstream fix
-
-Sites like lidl.fi fail with "Failed to read connection" due to `CPPHTTPLIB_HEADER_MAX_LENGTH` being too small.
-
-- Issue: https://github.com/duckdb/duckdb/pull/20460
-- Workaround: None currently
-
-### 4. True multi-threading not implemented (F1)
+### 1. True multi-threading not implemented (F1)
 **Status**: Backlog
 
 - Single-threaded crawl processing
@@ -85,3 +77,4 @@ Sites like lidl.fi fail with "Failed to read connection" due to `CPPHTTPLIB_HEAD
 - [x] HTTP/2 support (libcurl + nghttp2)
 - [x] G5: Redirect tracking (final_url, redirect_count columns)
 - [x] N5: Meta robots tag support (noindex clears body, nofollow skips link extraction)
+- [x] Large HTTP headers support (libcurl has no header size limit)
