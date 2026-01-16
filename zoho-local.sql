@@ -11,37 +11,32 @@ CRAWL (SELECT 'http://localhost:48765/zoho-career.html') INTO zoho_raw
 WITH (user_agent 'TestBot/1.0') LIMIT 1;
 
 -- Extract job postings from the js column
--- The jobs variable contains a JSON array of job objects
 CREATE OR REPLACE TABLE zoho_jobs AS
 WITH jobs_json AS (
-    SELECT
-        url,
-        crawled_at,
-        json(js->>'jobs') as jobs_array
+    SELECT url, crawled_at, json(js->>'jobs') as jobs_array
     FROM zoho_raw
-    WHERE json_valid(js->>'jobs')  -- js is '{}' when empty, ->>'jobs' is NULL
+    WHERE json_valid(js->>'jobs')
 )
 SELECT
-    json_extract_string(job.j, '$.id') as job_id,
-    json_extract_string(job.j, '$.Posting_Title') as title,
-    json_extract_string(job.j, '$.Poste') as position,
-    json_extract_string(job.j, '$.Job_Type') as job_type,
-    json_extract_string(job.j, '$.Salary') as salary,
-    json_extract_string(job.j, '$.Currency') as currency,
-    json_extract_string(job.j, '$.City') as city,
-    json_extract_string(job.j, '$.State') as state,
-    json_extract_string(job.j, '$.Country') as country,
-    json_extract_string(job.j, '$.Zip_Code') as zip_code,
-    COALESCE(json_extract_string(job.j, '$.Remote_Job') = 'true', false) as is_remote,
-    json_extract_string(job.j, '$.Industry') as industry,
-    json_extract_string(job.j, '$.Work_Experience') as experience,
-    json_extract_string(job.j, '$.Date_Opened') as date_opened,
-    json_extract(job.j, '$.Langue') as languages,
-    -- Clean HTML from description
-    regexp_replace(json_extract_string(job.j, '$.Job_Description'), '<[^>]*>', '', 'g') as description_text,
-    json_extract_string(job.j, '$.Job_Description') as description_html,
-    json_extract_string(job.j, '$.Required_Skills') as required_skills,
-    COALESCE(json_extract_string(job.j, '$.Publish') = 'true', false) as is_published,
+    job.j->>'id' as job_id,
+    job.j->>'Posting_Title' as title,
+    job.j->>'Poste' as position,
+    job.j->>'Job_Type' as job_type,
+    job.j->>'Salary' as salary,
+    job.j->>'Currency' as currency,
+    job.j->>'City' as city,
+    job.j->>'State' as state,
+    job.j->>'Country' as country,
+    job.j->>'Zip_Code' as zip_code,
+    (job.j->>'Remote_Job')::BOOLEAN as is_remote,
+    job.j->>'Industry' as industry,
+    job.j->>'Work_Experience' as experience,
+    job.j->>'Date_Opened' as date_opened,
+    job.j->'Langue' as languages,
+    regexp_replace(job.j->>'Job_Description', '<[^>]*>', '', 'g') as description_text,
+    job.j->>'Job_Description' as description_html,
+    job.j->>'Required_Skills' as required_skills,
+    (job.j->>'Publish')::BOOLEAN as is_published,
     jobs_json.url as source_url,
     jobs_json.crawled_at
 FROM jobs_json,
