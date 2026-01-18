@@ -21,17 +21,24 @@ STREAM (
         )
     ),
     job_pages AS (
-        SELECT c.url, c.html.js['jobs'][0] as job
+        SELECT c.url, htmlpath(c.html.body, 'script@$jobs[0]')::JSON as job
         FROM job_urls, LATERAL crawl_url(job_url) c
-        WHERE c.status = 200 AND c.html.js['jobs'] IS NOT NULL
+        WHERE c.status = 200
     )
-    SELECT url, job->>'id' as id, job->>'Posting_Title' as posting_title,
-           job->>'City' as city, job->>'State' as state, job->>'Country' as country,
-           job->>'Industry' as industry, job->>'Job_Type' as job_type,
-           job->>'Work_Experience' as work_experience,
-           (job->>'Remote_Job')::BOOLEAN as remote_job,
-           (job->>'Date_Opened')::DATE as date_opened,
-           job->>'Salary' as salary, job->>'Job_Description' as job_description
+    SELECT
+            url,
+            job->>'id' as id,
+            job->>'Posting_Title' as posting_title,
+            job->>'City' as city,
+            job->>'State' as state,
+            job->>'Country' as country,
+            job->>'Industry' as industry,
+            job->>'Job_Type' as job_type,
+            job->>'Work_Experience' as work_experience,
+            (job->>'Remote_Job')::BOOLEAN as remote_job,
+            (job->>'Date_Opened')::DATE as date_opened,
+            job->>'Salary' as salary,
+            job->>'Job_Description' as job_description
     FROM job_pages
 ) INTO jobs;
 
