@@ -27,6 +27,8 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/main/secret/secret_manager.hpp"
+#include "duckdb/catalog/catalog_transaction.hpp"
 
 #include <set>
 #include <map>
@@ -108,6 +110,62 @@ static string BuildBatchCrawlRequest(const vector<string> &urls,
     string result_str(json_str, len);
     free(json_str);
     return result_str;
+}
+
+//===--------------------------------------------------------------------===//
+// HTTP Secret Lookup
+//===--------------------------------------------------------------------===//
+
+// Look up HTTP secrets for a URL and populate extra_headers
+static void ApplyHttpSecrets(ClientContext &context, const string &url,
+                              string &http_proxy, string &http_proxy_username, string &http_proxy_password,
+                              std::map<string, string> &extra_headers) {
+    auto &secret_manager = SecretManager::Get(context);
+    auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+
+    // Look up HTTP secret matching the URL
+    auto secret_match = secret_manager.LookupSecret(transaction, url, "http");
+    if (!secret_match.HasMatch()) {
+        return;
+    }
+
+    auto &secret_entry = *secret_match.secret_entry;
+    auto *kv_secret = dynamic_cast<const KeyValueSecret *>(secret_entry.secret.get());
+    if (!kv_secret) {
+        return;  // Not a KeyValueSecret
+    }
+
+    // Get bearer_token and add as Authorization header
+    Value bearer_token;
+    if (kv_secret->TryGetValue("bearer_token", bearer_token) && !bearer_token.IsNull()) {
+        extra_headers["Authorization"] = "Bearer " + bearer_token.ToString();
+    }
+
+    // Get extra_http_headers (MAP type)
+    Value headers_val;
+    if (kv_secret->TryGetValue("extra_http_headers", headers_val) && !headers_val.IsNull()) {
+        if (headers_val.type().id() == LogicalTypeId::MAP) {
+            auto &entries = MapValue::GetChildren(headers_val);
+            for (auto &entry : entries) {
+                auto &kv = StructValue::GetChildren(entry);
+                if (kv.size() == 2 && !kv[0].IsNull() && !kv[1].IsNull()) {
+                    extra_headers[kv[0].ToString()] = kv[1].ToString();
+                }
+            }
+        }
+    }
+
+    // Get proxy settings from secret (override DuckDB settings)
+    Value proxy_val;
+    if (kv_secret->TryGetValue("http_proxy", proxy_val) && !proxy_val.IsNull()) {
+        http_proxy = proxy_val.ToString();
+    }
+    if (kv_secret->TryGetValue("http_proxy_username", proxy_val) && !proxy_val.IsNull()) {
+        http_proxy_username = proxy_val.ToString();
+    }
+    if (kv_secret->TryGetValue("http_proxy_password", proxy_val) && !proxy_val.IsNull()) {
+        http_proxy_password = proxy_val.ToString();
+    }
 }
 
 //===--------------------------------------------------------------------===//
@@ -824,6 +882,13 @@ static void CrawlFunction(ClientContext &context, TableFunctionInput &data, Data
 
         // Fetch if not cached
         if (!from_cache) {
+            // Apply HTTP secrets for this specific URL (may override global settings)
+            string http_proxy = bind_data.http_proxy;
+            string http_proxy_username = bind_data.http_proxy_username;
+            string http_proxy_password = bind_data.http_proxy_password;
+            std::map<string, string> extra_headers = bind_data.extra_headers;
+            ApplyHttpSecrets(context, url_to_fetch, http_proxy, http_proxy_username, http_proxy_password, extra_headers);
+
             string request_json = BuildBatchCrawlRequest(
                 {url_to_fetch},
                 "{}",  // No extraction specs
@@ -832,10 +897,10 @@ static void CrawlFunction(ClientContext &context, TableFunctionInput &data, Data
                 1,  // Single URL, single concurrency
                 bind_data.delay_ms,
                 bind_data.respect_robots,
-                bind_data.http_proxy,
-                bind_data.http_proxy_username,
-                bind_data.http_proxy_password,
-                bind_data.extra_headers
+                http_proxy,
+                http_proxy_username,
+                http_proxy_password,
+                extra_headers
             );
 
             string response_json = CrawlBatchWithRust(request_json);
