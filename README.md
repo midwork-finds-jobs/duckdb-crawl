@@ -5,7 +5,7 @@ A high-performance web crawler extension for DuckDB that fetches web pages, extr
 ## Features
 
 - **Native SQL syntax** - `CRAWL` statement integrates seamlessly with DuckDB
-- **HTTP/1.1, HTTP/2, HTTP/3** support via libcurl
+- **HTTP/1.1, HTTP/2** support via reqwest (Rust)
 - **Parallel crawling** with configurable thread pools
 - **robots.txt compliance** with crawl delay respect
 - **Sitemap discovery** and parsing (XML, gzip)
@@ -43,8 +43,8 @@ A high-performance web crawler extension for DuckDB that fetches web pages, extr
 │       │             │             │             │              │
 │       ▼             ▼             ▼             ▼              │
 │  ┌─────────────────────────────────────────────────────┐      │
-│  │              libcurl (HTTP Client)                   │      │
-│  │    HTTP/1.1 · HTTP/2 · HTTP/3 · TLS · Keep-Alive    │      │
+│  │              reqwest (HTTP Client)                   │      │
+│  │    HTTP/1.1 · HTTP/2 · TLS · Keep-Alive             │      │
 │  │    Connection pooling · Compression · Redirects     │      │
 │  └─────────────────────────────────────────────────────┘      │
 └─────────────────────────────────────────────────────────────────┘
@@ -85,14 +85,13 @@ CRAWL (SELECT 'example.com')                       -- Auto-discover sitemap
 
 If `follow_links` is enabled, it parses HTML for `<a href>` links and adds them to the queue, respecting `max_crawl_depth` and same-domain rules.
 
-### 2. HTTP Fetching (libcurl)
+### 2. HTTP Fetching (reqwest)
 
-Each URL is fetched using libcurl with:
+Each URL is fetched using reqwest with:
 
 - **Connection pooling** - Reuses TCP connections for same hosts
 - **Keep-alive** - Maintains persistent connections
 - **HTTP/2 multiplexing** - Multiple requests over single connection
-- **HTTP/3 QUIC** - UDP-based transport when available
 - **Automatic decompression** - gzip, deflate, brotli
 - **Redirect following** - Configurable limit
 - **TLS verification** - Certificate validation
@@ -863,7 +862,7 @@ WITH (user_agent 'MyBot/1.0', timeout_seconds 60);
 ## Performance
 
 - **Parallel fetching**: Configurable thread pool
-- **Connection reuse**: libcurl connection pooling
+- **Connection reuse**: reqwest connection pooling
 - **HTTP/2 multiplexing**: Multiple requests per connection
 - **Streaming parsing**: HTML parsed incrementally
 - **Batch inserts**: Efficient database writes
@@ -885,10 +884,10 @@ Typical throughput: **50-200 pages/second** depending on:
 ## Dependencies
 
 Built with:
-- **libcurl** - HTTP client (HTTP/1-3, TLS)
-- **libxml2** - HTML parsing (C++)
-- **yyjson** - JSON parsing
-- **Rust** - HTML extraction (scraper, tree-sitter)
+- **reqwest** - HTTP client (Rust, HTTP/1.1, HTTP/2, TLS)
+- **scraper** - HTML parsing (Rust, CSS selectors)
+- **yyjson** - JSON parsing (C++)
+- **readability** - Article extraction (Rust)
 
 ## License
 
