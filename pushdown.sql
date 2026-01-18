@@ -15,7 +15,7 @@ STREAM (
     WITH job_urls AS (
         SELECT format('{}jobs/Careers/{}', url, job_id) as job_url
         FROM (
-            SELECT url, unnest(htmlpath(html.document, 'input#jobs@value[*].id')::VARCHAR[]) as job_id
+            SELECT url, unnest(htmlpath(html.document, 'input#jobs@value[*].id')::BIGINT[]) as job_id
             FROM crawl(['https://carrieres.os4techno.com/', 'https://recruit.srilankan.com/'])
             WHERE status = 200
         )
