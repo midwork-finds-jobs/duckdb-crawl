@@ -17,10 +17,11 @@
 
 ## In Progress
 
-- [ ] WHEN NOT MATCHED BY SOURCE clause in STREAM INTO MERGE
+(none)
 
 ## Implemented Features
 
+- [x] WHEN NOT MATCHED BY SOURCE clause in CRAWLING MERGE INTO (UPDATE SET, DELETE, with conditions)
 - [x] SET crawler_* settings (user_agent, default_delay, respect_robots, timeout_ms, max_response_bytes)
 - [x] DuckDB http_proxy settings integration
 - [x] CREATE SECRET integration (bearer_token, extra_http_headers)

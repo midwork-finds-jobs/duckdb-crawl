@@ -2,119 +2,64 @@
 
 #include "duckdb.hpp"
 #include "duckdb/parser/parser_extension.hpp"
+#include "duckdb/parser/tableref.hpp"
+#include "duckdb/parser/parsed_expression.hpp"
+#include "duckdb/common/enums/merge_action_type.hpp"
+#include "duckdb/parser/statement/insert_statement.hpp"
 
 namespace duckdb {
 
-// Statement types for CRAWL parser
-enum class CrawlStatementType : uint8_t {
-	CRAWL,     // CRAWL (...) INTO table
-	STREAM     // STREAM (query) INTO table - incremental writes
+// Single MERGE action (UPDATE, DELETE, or INSERT with optional condition)
+struct StreamMergeAction {
+	MergeActionType action_type = MergeActionType::MERGE_INSERT;
+	unique_ptr<ParsedExpression> condition;  // Optional AND condition
+	InsertColumnOrder column_order = InsertColumnOrder::INSERT_BY_POSITION;
+
+	// For UPDATE: SET clauses
+	vector<string> set_columns;
+	vector<unique_ptr<ParsedExpression>> set_expressions;
+
+	// For INSERT: column list and values
+	vector<string> insert_columns;
+	vector<unique_ptr<ParsedExpression>> insert_expressions;
+
+	StreamMergeAction() = default;
+	StreamMergeAction(const StreamMergeAction &other);
+	StreamMergeAction &operator=(const StreamMergeAction &other);
 };
 
-// Extraction source types
-enum class ExtractSource : uint8_t {
-	JSONLD,
-	MICRODATA,
-	OPENGRAPH,
-	META,
-	JS,
-	CSS
-};
+// Parsed data from CRAWLING MERGE INTO (uses DuckDB's MERGE parser)
+struct StreamMergeParseData : public ParserExtensionParseData {
+	// Target table (parsed AST)
+	unique_ptr<TableRef> target;
 
-// Specification for a single EXTRACT column
-struct ExtractSpec {
-	string expression;     // e.g., "jsonld.Product.name" or "css '.price::text'"
-	string alias;          // e.g., "name"
-	bool is_text;          // true for ->> (text), false for -> (json)
+	// Source query (parsed AST)
+	unique_ptr<TableRef> source;
 
-	// Enhanced fields for new syntax
-	ExtractSource source;  // Source type
-	string path;           // Path within source (dot notation)
-	string target_type;    // Optional type: DECIMAL, INTEGER, BOOLEAN, VARCHAR
-	string transform;      // Optional transform: parse_price, trim, lowercase
+	// ON condition (parsed AST)
+	unique_ptr<ParsedExpression> join_condition;
 
-	// For COALESCE
-	bool is_coalesce;      // true if this is a COALESCE expression
-	vector<string> coalesce_paths;  // Paths for COALESCE (source.path format)
+	// Alternative: USING (col1, col2) instead of ON
+	vector<string> using_columns;
 
-	// For JSON cast and array expansion (::json, [*], .field syntax)
-	bool is_json_cast;     // true if ::json suffix present
-	bool expand_array;     // true if [*] array expansion requested
-	string array_field;    // field to extract from each array element (e.g., "id" for [*].id)
-	string json_path;      // additional -> navigation after ::json cast
+	// Actions by condition type (WHEN MATCHED, WHEN NOT MATCHED, etc.)
+	map<MergeActionCondition, vector<StreamMergeAction>> actions;
 
-	ExtractSpec() : is_text(false), source(ExtractSource::JSONLD), is_coalesce(false),
-	                is_json_cast(false), expand_array(false) {}
-};
+	// Extracted join columns for UPDATE BY NAME exclusion (derived from join_condition)
+	vector<string> join_columns;
 
-// Parsed data from CRAWL statement
-struct CrawlParseData : public ParserExtensionParseData {
-	CrawlStatementType statement_type = CrawlStatementType::CRAWL;
-	string source_query;      // The SELECT query for URLs or hostnames
-	string target_table;      // Table to insert results into
-	string user_agent;        // Required user_agent parameter
+	// Source query as SQL string (for LIMIT injection and execution)
+	string source_query_sql;
 
-	// Optional parameters with defaults
-	double default_crawl_delay = 1.0;
-	double min_crawl_delay = 0.0;
-	double max_crawl_delay = 60.0;
-	int timeout_seconds = 30;
-	bool respect_robots_txt = true;
-	bool log_skipped = true;
-
-	// SITES mode specific options
-	string url_filter;        // LIKE pattern to filter discovered URLs (e.g., '%/product/%')
-	double sitemap_cache_hours = 24.0;  // Hours to cache sitemap discovery results
-	bool update_stale = false;  // Re-crawl stale URLs based on sitemap lastmod/changefreq
-
-	// Rate limiting and retry options
-	int max_retry_backoff_seconds = 600;  // Max Fibonacci backoff for 429/5XX/timeout (10 min default)
-	int max_parallel_per_domain = 8;      // Max concurrent requests per domain (if no crawl-delay)
-	int max_total_connections = 32;       // Global max concurrent connections across all domains
-
-	// Resource limits
-	int64_t max_response_bytes = 10 * 1024 * 1024;  // Max response size (10MB default)
-	bool compress = true;                  // Request gzip/deflate compression
-
-	// Content-Type filtering (comma-separated, supports wildcards like "text/*")
-	string accept_content_types;  // Only accept these types (empty = accept all)
-	string reject_content_types;  // Reject these types (checked after accept)
-
-	// Link-following fallback (when sitemap not found)
-	bool follow_links = false;            // Enable link-based crawling fallback
-	bool allow_subdomains = false;        // Follow links to subdomains (e.g., blog.example.com)
-	int max_crawl_pages = 10000;          // Safety limit on pages to discover
-	int max_crawl_depth = 10;             // Max link depth from start URL
-	bool respect_nofollow = true;         // Skip rel="nofollow" links and nofollow meta
-	bool follow_canonical = true;         // Replace URL with canonical if different
-
-	// Multi-threading
-	int num_threads = 0;                  // 0 = auto (hardware_concurrency)
-
-	// Row limit (LIMIT clause) - stops crawl after N matching rows inserted
-	int64_t row_limit = 0;                // 0 = no limit
-
-	// Structured data extraction
-	bool extract_js = true;               // Extract JS variables (can be disabled for performance)
-
-	// EXTRACT clause - custom column extraction
-	vector<ExtractSpec> extract_specs;    // Empty = use default schema
+	// Row limit for pushdown
+	int64_t row_limit = 0;
+	int64_t batch_size = 100;
 
 	unique_ptr<ParserExtensionParseData> Copy() const override;
 	string ToString() const override;
 };
 
-// Parsed data from STREAM statement
-struct StreamParseData : public ParserExtensionParseData {
-	string source_query;      // The SELECT query to stream
-	string target_table;      // Table to insert results into
-	int64_t batch_size = 100; // Rows per batch write
-
-	unique_ptr<ParserExtensionParseData> Copy() const override;
-	string ToString() const override;
-};
-
-// Parser extension for CRAWL and STREAM statements
+// Parser extension for CRAWLING statements
 class CrawlParserExtension : public ParserExtension {
 public:
 	CrawlParserExtension();
