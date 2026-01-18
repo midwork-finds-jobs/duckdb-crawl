@@ -1,0 +1,74 @@
+# name: test/sql/htmlpath_extraction.test
+# description: Test htmlpath() and jq() extraction functions
+# group: [crawler]
+
+require crawler
+
+# Test basic text extraction with @text suffix
+query I
+SELECT htmlpath('<div class="price">$29.99</div>', 'div@text')::VARCHAR;
+----
+"$29.99"
+
+# Test CSS class selector with @text
+query I
+SELECT htmlpath('<div class="price">$29.99</div>', 'div.price@text')::VARCHAR;
+----
+"$29.99"
+
+# Test attribute extraction with @attr
+query I
+SELECT htmlpath('<a href="https://example.com">Link</a>', 'a@href')::VARCHAR;
+----
+"https://example.com"
+
+# Test jq() 2-arg returns STRUCT with text
+query I
+SELECT jq('<div class="title">Hello World</div>', 'div.title').text;
+----
+Hello World
+
+# Test jq() 3-arg returns attribute directly
+query I
+SELECT jq('<a href="https://test.com" class="link">Test</a>', 'a.link', 'href');
+----
+https://test.com
+
+# Test jq() with class-only selector
+query I
+SELECT jq('<div class="price">$29.99</div>', '.price').text;
+----
+$29.99
+
+# Test data attribute extraction
+query I
+SELECT htmlpath('<button data-product-id="12345">Buy</button>', 'button@data-product-id')::VARCHAR;
+----
+"12345"
+
+# Test extracting from JSON-LD script tag
+query I
+SELECT htmlpath(
+    '<html><head><script type="application/ld+json">{"@type":"JobPosting","title":"Engineer"}</script></head></html>',
+    'script[type="application/ld+json"]@text.title'
+)::VARCHAR;
+----
+"Engineer"
+
+# Test nested selector
+query I
+SELECT htmlpath('<article><header><h1>Title</h1></header></article>', 'article header h1@text')::VARCHAR;
+----
+"Title"
+
+# Test extracting HTML content
+query I
+SELECT jq('<div><span>Text</span></div>', 'div').html;
+----
+<div><span>Text</span></div>
+
+# Test attribute map
+query I
+SELECT jq('<a href="https://test.com" class="link" title="Test Link">Test</a>', 'a').attr['title'];
+----
+Test Link

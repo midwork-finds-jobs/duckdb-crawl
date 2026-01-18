@@ -11,9 +11,7 @@
 
 ## Open Questions
 
-* Ensure that robots.txt sitemap still works too and sitemap honours the crawl-delay in robots.txt
-    * Parse robots.txt into a cache which has 24 hours TTL
-* Build example SQL for crawling blog posts, product pages, jobs, events. Create unittests for those too.
+(none - all major features implemented)
 
 ## In Progress
 
@@ -25,6 +23,9 @@
 - [x] SET crawler_* settings (user_agent, default_delay, respect_robots, timeout_ms, max_response_bytes)
 - [x] DuckDB http_proxy settings integration
 - [x] CREATE SECRET integration (bearer_token, extra_http_headers)
+- [x] robots.txt parsing with 1-hour cache TTL, crawl-delay, and sitemap extraction
+- [x] jq() and htmlpath() extraction functions with CSS selectors and JSON path
+- [x] Example SQL for job listings, products, blog posts, and events (see examples/)
 
 - [x] F2: Connection pooling (libcurl handle pool)
 - [x] F3: Batch inserts

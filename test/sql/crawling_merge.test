@@ -1,0 +1,259 @@
+# name: test/sql/crawling_merge.test
+# description: Test CRAWLING MERGE INTO with MERGE semantics (uses DuckDB's MERGE parser)
+# group: [crawler]
+
+require crawler
+
+# Test INSERT only
+statement ok
+CREATE TABLE test_insert (url VARCHAR PRIMARY KEY, title VARCHAR);
+
+statement ok
+CRAWLING MERGE INTO test_insert
+USING (SELECT 'https://example.com/new' as url, 'New Page' as title) AS src
+ON (src.url = test_insert.url)
+WHEN NOT MATCHED THEN INSERT BY NAME;
+
+query II
+SELECT * FROM test_insert ORDER BY url;
+----
+https://example.com/new	New Page
+
+statement ok
+DROP TABLE test_insert;
+
+# Test UPDATE only
+statement ok
+CREATE TABLE test_update (url VARCHAR PRIMARY KEY, title VARCHAR);
+
+statement ok
+INSERT INTO test_update VALUES ('https://example.com/old', 'Old Title');
+
+statement ok
+CRAWLING MERGE INTO test_update
+USING (SELECT 'https://example.com/old' as url, 'Updated Title' as title) AS src
+ON (src.url = test_update.url)
+WHEN MATCHED THEN UPDATE BY NAME;
+
+query II
+SELECT * FROM test_update ORDER BY url;
+----
+https://example.com/old	Updated Title
+
+statement ok
+DROP TABLE test_update;
+
+# Test UPSERT (INSERT + UPDATE)
+statement ok
+CREATE TABLE test_upsert (url VARCHAR PRIMARY KEY, title VARCHAR);
+
+statement ok
+INSERT INTO test_upsert VALUES ('https://example.com/existing', 'Existing');
+
+statement ok
+CRAWLING MERGE INTO test_upsert
+USING (
+    SELECT 'https://example.com/existing' as url, 'Updated' as title
+    UNION ALL
+    SELECT 'https://example.com/new' as url, 'New' as title
+) AS src
+ON (src.url = test_upsert.url)
+WHEN MATCHED THEN UPDATE BY NAME
+WHEN NOT MATCHED THEN INSERT BY NAME;
+
+query II
+SELECT * FROM test_upsert ORDER BY url;
+----
+https://example.com/existing	Updated
+https://example.com/new	New
+
+statement ok
+DROP TABLE test_upsert;
+
+# Test DELETE when matched
+statement ok
+CREATE TABLE test_delete (id INTEGER, status VARCHAR);
+
+statement ok
+INSERT INTO test_delete VALUES (1, 'active'), (2, 'inactive'), (3, 'active');
+
+statement ok
+CRAWLING MERGE INTO test_delete
+USING (SELECT 2 as id, 'inactive' as status) AS src
+ON (src.id = test_delete.id)
+WHEN MATCHED THEN DELETE;
+
+query II
+SELECT * FROM test_delete ORDER BY id;
+----
+1	active
+3	active
+
+statement ok
+DROP TABLE test_delete;
+
+# Test conditional UPDATE (WHEN MATCHED AND condition)
+statement ok
+CREATE TABLE test_conditional (url VARCHAR, value INTEGER, updated_at TIMESTAMP);
+
+statement ok
+INSERT INTO test_conditional VALUES
+    ('https://example.com/stale', 10, TIMESTAMP '2024-01-01 00:00:00'),
+    ('https://example.com/fresh', 20, TIMESTAMP '2026-01-17 00:00:00');
+
+statement ok
+CRAWLING MERGE INTO test_conditional
+USING (
+    SELECT 'https://example.com/stale' as url, 100 as value, current_timestamp as updated_at
+    UNION ALL
+    SELECT 'https://example.com/fresh' as url, 200 as value, current_timestamp as updated_at
+) AS src
+ON (src.url = test_conditional.url)
+WHEN MATCHED AND age(test_conditional.updated_at) > INTERVAL '1 day' THEN UPDATE BY NAME
+WHEN NOT MATCHED THEN INSERT BY NAME;
+
+# Only stale row should be updated (value = 100), fresh row should keep original (value = 20)
+query I
+SELECT value FROM test_conditional WHERE url = 'https://example.com/stale';
+----
+100
+
+query I
+SELECT value FROM test_conditional WHERE url = 'https://example.com/fresh';
+----
+20
+
+statement ok
+DROP TABLE test_conditional;
+
+# Test WHEN NOT MATCHED BY SOURCE - DELETE
+statement ok
+CREATE TABLE test_nmbs_delete (url VARCHAR PRIMARY KEY, title VARCHAR);
+
+statement ok
+INSERT INTO test_nmbs_delete VALUES
+    ('https://example.com/keep1', 'Keep 1'),
+    ('https://example.com/keep2', 'Keep 2'),
+    ('https://example.com/remove', 'To Remove');
+
+statement ok
+CRAWLING MERGE INTO test_nmbs_delete
+USING (
+    SELECT 'https://example.com/keep1' as url, 'Updated Keep 1' as title
+    UNION ALL
+    SELECT 'https://example.com/keep2' as url, 'Updated Keep 2' as title
+) AS src
+ON (src.url = test_nmbs_delete.url)
+WHEN MATCHED THEN UPDATE BY NAME
+WHEN NOT MATCHED BY SOURCE THEN DELETE;
+
+query II
+SELECT * FROM test_nmbs_delete ORDER BY url;
+----
+https://example.com/keep1	Updated Keep 1
+https://example.com/keep2	Updated Keep 2
+
+statement ok
+DROP TABLE test_nmbs_delete;
+
+# Test WHEN NOT MATCHED BY SOURCE - UPDATE SET (soft delete)
+statement ok
+CREATE TABLE test_nmbs_update (url VARCHAR PRIMARY KEY, title VARCHAR, is_deleted BOOLEAN DEFAULT false);
+
+statement ok
+INSERT INTO test_nmbs_update VALUES
+    ('https://example.com/active1', 'Active 1', false),
+    ('https://example.com/active2', 'Active 2', false),
+    ('https://example.com/stale', 'Stale', false);
+
+statement ok
+CRAWLING MERGE INTO test_nmbs_update
+USING (
+    SELECT 'https://example.com/active1' as url, 'Updated Active 1' as title, false as is_deleted
+    UNION ALL
+    SELECT 'https://example.com/active2' as url, 'Updated Active 2' as title, false as is_deleted
+) AS src
+ON (src.url = test_nmbs_update.url)
+WHEN MATCHED THEN UPDATE BY NAME
+WHEN NOT MATCHED BY SOURCE THEN UPDATE SET is_deleted = true;
+
+# Stale row should have is_deleted = true
+query III
+SELECT url, title, is_deleted FROM test_nmbs_update WHERE url = 'https://example.com/stale';
+----
+https://example.com/stale	Stale	true
+
+# Active rows should be updated with is_deleted = false
+query III
+SELECT url, title, is_deleted FROM test_nmbs_update WHERE url LIKE '%active%' ORDER BY url;
+----
+https://example.com/active1	Updated Active 1	false
+https://example.com/active2	Updated Active 2	false
+
+statement ok
+DROP TABLE test_nmbs_update;
+
+# Test WHEN NOT MATCHED BY SOURCE with AND condition
+statement ok
+CREATE TABLE test_nmbs_cond (url VARCHAR PRIMARY KEY, status VARCHAR, is_archived BOOLEAN DEFAULT false);
+
+statement ok
+INSERT INTO test_nmbs_cond VALUES
+    ('https://example.com/new', 'new', false),
+    ('https://example.com/archived', 'archived', true),
+    ('https://example.com/old', 'old', false);
+
+statement ok
+CRAWLING MERGE INTO test_nmbs_cond
+USING (
+    SELECT 'https://example.com/new' as url, 'active' as status, false as is_archived
+) AS src
+ON (src.url = test_nmbs_cond.url)
+WHEN MATCHED THEN UPDATE BY NAME
+WHEN NOT MATCHED BY SOURCE AND is_archived = false THEN UPDATE SET status = 'removed';
+
+# Only 'old' should have status='removed' (it wasn't in source and wasn't archived)
+# 'archived' should keep its status (condition is_archived=false didn't match)
+query III
+SELECT url, status, is_archived FROM test_nmbs_cond ORDER BY url;
+----
+https://example.com/archived	archived	true
+https://example.com/new	active	false
+https://example.com/old	removed	false
+
+statement ok
+DROP TABLE test_nmbs_cond;
+
+# Test return values (direct function call still works)
+# Parameters: source_query, source_alias, target_table, join_condition, join_columns,
+#             has_matched, matched_condition, matched_action, matched_update_by_name,
+#             has_not_matched, not_matched_insert_by_name,
+#             has_not_matched_by_source, not_matched_by_source_condition, not_matched_by_source_action,
+#             not_matched_by_source_update_by_name, not_matched_by_source_set_clauses,
+#             row_limit, batch_size
+query III
+SELECT * FROM stream_merge_internal(
+    'SELECT 1 as id, ''new'' as status UNION ALL SELECT 2 as id, ''new'' as status',
+    'src',
+    'test_returns',
+    'src.id = test_returns.id',
+    'id',
+    true,   -- has_matched
+    '',     -- matched_condition
+    0,      -- matched_action (0=UPDATE)
+    true,   -- matched_update_by_name
+    true,   -- has_not_matched
+    true,   -- not_matched_insert_by_name
+    false,  -- has_not_matched_by_source
+    '',     -- not_matched_by_source_condition
+    0,      -- not_matched_by_source_action (0=UPDATE)
+    false,  -- not_matched_by_source_update_by_name
+    '',     -- not_matched_by_source_set_clauses
+    0,      -- row_limit
+    100     -- batch_size
+);
+----
+2	0	0
+
+statement ok
+DROP TABLE test_returns;
