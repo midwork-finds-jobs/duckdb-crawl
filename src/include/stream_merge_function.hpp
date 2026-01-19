@@ -5,6 +5,6 @@
 
 namespace duckdb {
 
-void RegisterStreamMergeFunction(ExtensionLoader &loader);
+void RegisterCrawlingMergeFunction(ExtensionLoader &loader);
 
 } // namespace duckdb

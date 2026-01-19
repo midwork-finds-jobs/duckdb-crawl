@@ -12,9 +12,9 @@
 namespace duckdb {
 
 //===--------------------------------------------------------------------===//
-// StreamMergeAction
+// CrawlingMergeAction
 //===--------------------------------------------------------------------===//
-StreamMergeAction::StreamMergeAction(const StreamMergeAction &other) {
+CrawlingMergeAction::CrawlingMergeAction(const CrawlingMergeAction &other) {
 	action_type = other.action_type;
 	condition = other.condition ? other.condition->Copy() : nullptr;
 	column_order = other.column_order;
@@ -28,7 +28,7 @@ StreamMergeAction::StreamMergeAction(const StreamMergeAction &other) {
 	}
 }
 
-StreamMergeAction &StreamMergeAction::operator=(const StreamMergeAction &other) {
+CrawlingMergeAction &CrawlingMergeAction::operator=(const CrawlingMergeAction &other) {
 	if (this != &other) {
 		action_type = other.action_type;
 		condition = other.condition ? other.condition->Copy() : nullptr;
@@ -48,10 +48,10 @@ StreamMergeAction &StreamMergeAction::operator=(const StreamMergeAction &other) 
 }
 
 //===--------------------------------------------------------------------===//
-// StreamMergeParseData
+// CrawlingMergeParseData
 //===--------------------------------------------------------------------===//
-unique_ptr<ParserExtensionParseData> StreamMergeParseData::Copy() const {
-	auto copy = make_uniq<StreamMergeParseData>();
+unique_ptr<ParserExtensionParseData> CrawlingMergeParseData::Copy() const {
+	auto copy = make_uniq<CrawlingMergeParseData>();
 	copy->target = target ? target->Copy() : nullptr;
 	copy->source = source ? source->Copy() : nullptr;
 	copy->join_condition = join_condition ? join_condition->Copy() : nullptr;
@@ -59,7 +59,7 @@ unique_ptr<ParserExtensionParseData> StreamMergeParseData::Copy() const {
 	for (auto &entry : actions) {
 		auto &action_list = copy->actions[entry.first];
 		for (auto &action : entry.second) {
-			action_list.push_back(StreamMergeAction(action));
+			action_list.push_back(CrawlingMergeAction(action));
 		}
 	}
 	copy->join_columns = join_columns;
@@ -69,7 +69,7 @@ unique_ptr<ParserExtensionParseData> StreamMergeParseData::Copy() const {
 	return copy;
 }
 
-string StreamMergeParseData::ToString() const {
+string CrawlingMergeParseData::ToString() const {
 	string result = "CRAWLING MERGE INTO ";
 	if (target) {
 		result += target->ToString();
@@ -311,7 +311,7 @@ static ParserExtensionParseResult ParseCrawlingMerge(const string &query) {
 	auto &merge_stmt = parser.statements[0]->Cast<MergeIntoStatement>();
 
 	// Create our parse data with AST components
-	auto data = make_uniq<StreamMergeParseData>();
+	auto data = make_uniq<CrawlingMergeParseData>();
 	data->target = merge_stmt.target->Copy();
 	data->source = merge_stmt.source->Copy();
 	data->join_condition = merge_stmt.join_condition ? merge_stmt.join_condition->Copy() : nullptr;
@@ -323,11 +323,11 @@ static ParserExtensionParseResult ParseCrawlingMerge(const string &query) {
 		ExtractJoinColumns(data->join_condition.get(), data->join_columns);
 	}
 
-	// Convert MergeIntoActions to our StreamMergeActions
+	// Convert MergeIntoActions to our CrawlingMergeActions
 	for (auto &entry : merge_stmt.actions) {
 		auto &action_list = data->actions[entry.first];
 		for (auto &action : entry.second) {
-			StreamMergeAction stream_action;
+			CrawlingMergeAction stream_action;
 			stream_action.action_type = action->action_type;
 			stream_action.condition = action->condition ? action->condition->Copy() : nullptr;
 			stream_action.column_order = action->column_order;
@@ -400,8 +400,8 @@ ParserExtensionPlanResult CrawlParserExtension::PlanCrawl(ParserExtensionInfo *i
 	ParserExtensionPlanResult result;
 
 	// Check if this is a CRAWLING MERGE statement
-	if (dynamic_cast<StreamMergeParseData *>(parse_data.get())) {
-		auto &merge_data = (StreamMergeParseData &)*parse_data;
+	if (dynamic_cast<CrawlingMergeParseData *>(parse_data.get())) {
+		auto &merge_data = (CrawlingMergeParseData &)*parse_data;
 
 		// Look up the registered stream_merge_internal function
 		auto catalog_entry = catalog.GetEntry(context, CatalogType::TABLE_FUNCTION_ENTRY, DEFAULT_SCHEMA,

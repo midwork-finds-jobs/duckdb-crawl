@@ -18,6 +18,7 @@
 #include "pipeline_state.hpp"
 #include <unordered_set>
 #include <regex>
+#include <atomic>
 
 namespace duckdb {
 
@@ -213,7 +214,7 @@ enum class MergeAction : int32_t {
 // Bind Data
 //===--------------------------------------------------------------------===//
 
-struct StreamMergeBindData : public TableFunctionData {
+struct CrawlingMergeBindData : public TableFunctionData {
 	string source_query;
 	string source_alias;
 	string target_table;
@@ -244,11 +245,15 @@ struct StreamMergeBindData : public TableFunctionData {
 // Global State
 //===--------------------------------------------------------------------===//
 
-struct StreamMergeGlobalState : public GlobalTableFunctionState {
+struct CrawlingMergeGlobalState : public GlobalTableFunctionState {
 	bool finished = false;
 	int64_t rows_inserted = 0;
 	int64_t rows_updated = 0;
 	int64_t rows_deleted = 0;
+
+	// Progress tracking for progress bar
+	std::atomic<int64_t> total_rows{0};
+	std::atomic<int64_t> processed_rows{0};
 
 	idx_t MaxThreads() const override { return 1; }
 };
@@ -257,9 +262,9 @@ struct StreamMergeGlobalState : public GlobalTableFunctionState {
 // Bind Function
 //===--------------------------------------------------------------------===//
 
-static unique_ptr<FunctionData> StreamMergeBind(ClientContext &context, TableFunctionBindInput &input,
+static unique_ptr<FunctionData> CrawlingMergeBind(ClientContext &context, TableFunctionBindInput &input,
                                                  vector<LogicalType> &return_types, vector<string> &names) {
-	auto bind_data = make_uniq<StreamMergeBindData>();
+	auto bind_data = make_uniq<CrawlingMergeBindData>();
 
 	// Parameters from parser (see PlanCrawl in crawl_parser.cpp)
 	bind_data->source_query = StringValue::Get(input.inputs[0]);
@@ -327,9 +332,9 @@ static unique_ptr<FunctionData> StreamMergeBind(ClientContext &context, TableFun
 // Init Global
 //===--------------------------------------------------------------------===//
 
-static unique_ptr<GlobalTableFunctionState> StreamMergeInitGlobal(ClientContext &context,
+static unique_ptr<GlobalTableFunctionState> CrawlingMergeInitGlobal(ClientContext &context,
                                                                     TableFunctionInitInput &input) {
-	return make_uniq<StreamMergeGlobalState>();
+	return make_uniq<CrawlingMergeGlobalState>();
 }
 
 //===--------------------------------------------------------------------===//
@@ -337,7 +342,7 @@ static unique_ptr<GlobalTableFunctionState> StreamMergeInitGlobal(ClientContext 
 //===--------------------------------------------------------------------===//
 
 // Build WHERE clause with values substituted from source row
-static string BuildWhereClause(const StreamMergeBindData &bind_data,
+static string BuildWhereClause(const CrawlingMergeBindData &bind_data,
                                const vector<string> &col_names,
                                unique_ptr<DataChunk> &chunk, idx_t row) {
 	// Parse join_condition and substitute alias.col references with actual values
@@ -367,7 +372,7 @@ static string BuildWhereClause(const StreamMergeBindData &bind_data,
 }
 
 // Check if row exists in target table
-static bool CheckExists(Connection &conn, const StreamMergeBindData &bind_data,
+static bool CheckExists(Connection &conn, const CrawlingMergeBindData &bind_data,
                         const vector<string> &col_names,
                         unique_ptr<DataChunk> &chunk, idx_t row) {
 	string where_clause = BuildWhereClause(bind_data, col_names, chunk, row);
@@ -382,7 +387,7 @@ static bool CheckExists(Connection &conn, const StreamMergeBindData &bind_data,
 }
 
 // Check if matched condition is satisfied
-static bool CheckMatchedCondition(Connection &conn, const StreamMergeBindData &bind_data,
+static bool CheckMatchedCondition(Connection &conn, const CrawlingMergeBindData &bind_data,
                                   const vector<string> &col_names,
                                   unique_ptr<DataChunk> &chunk, idx_t row) {
 	if (bind_data.matched_condition.empty()) {
@@ -404,7 +409,7 @@ static bool CheckMatchedCondition(Connection &conn, const StreamMergeBindData &b
 }
 
 // Build UPDATE BY NAME statement
-static string BuildUpdateByName(const StreamMergeBindData &bind_data,
+static string BuildUpdateByName(const CrawlingMergeBindData &bind_data,
                                 const vector<string> &col_names,
                                 const vector<LogicalType> &col_types,
                                 unique_ptr<DataChunk> &chunk, idx_t row) {
@@ -439,7 +444,7 @@ static string BuildUpdateByName(const StreamMergeBindData &bind_data,
 }
 
 // Build DELETE statement
-static string BuildDelete(const StreamMergeBindData &bind_data,
+static string BuildDelete(const CrawlingMergeBindData &bind_data,
                           const vector<string> &col_names,
                           unique_ptr<DataChunk> &chunk, idx_t row) {
 	return "DELETE FROM " + QuoteSqlIdentifier(bind_data.target_table) +
@@ -447,7 +452,7 @@ static string BuildDelete(const StreamMergeBindData &bind_data,
 }
 
 // Build INSERT BY NAME statement using DuckDB's INSERT BY NAME syntax
-static string BuildInsertByName(const StreamMergeBindData &bind_data,
+static string BuildInsertByName(const CrawlingMergeBindData &bind_data,
                                 const vector<string> &col_names,
                                 unique_ptr<DataChunk> &chunk, idx_t row) {
 	// DuckDB supports: INSERT INTO table BY NAME SELECT ... AS col1, ... AS col2
@@ -469,9 +474,9 @@ static string BuildInsertByName(const StreamMergeBindData &bind_data,
 // Main Function - Merge Execution
 //===--------------------------------------------------------------------===//
 
-static void StreamMergeFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
-	auto &bind_data = data.bind_data->CastNoConst<StreamMergeBindData>();
-	auto &state = data.global_state->Cast<StreamMergeGlobalState>();
+static void CrawlingMergeFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &bind_data = data.bind_data->CastNoConst<CrawlingMergeBindData>();
+	auto &state = data.global_state->Cast<CrawlingMergeGlobalState>();
 
 	if (state.finished) {
 		output.SetCardinality(0);
@@ -529,8 +534,26 @@ static void StreamMergeFunction(ClientContext &context, TableFunctionInput &data
 	vector<string> col_names = query_result->names;
 	vector<LogicalType> col_types = query_result->types;
 
-	// Create target table from first chunk if needed
-	auto first_chunk = query_result->Fetch();
+	// Collect all chunks first to know total (enables progress bar)
+	vector<unique_ptr<DataChunk>> all_chunks;
+	int64_t total_rows = 0;
+	while (auto chunk = query_result->Fetch()) {
+		if (chunk->size() > 0) {
+			total_rows += chunk->size();
+			all_chunks.push_back(std::move(chunk));
+		}
+	}
+
+	// Update progress state with total
+	state.total_rows.store(total_rows);
+	state.processed_rows.store(0);
+
+	// Get first chunk for table creation
+	unique_ptr<DataChunk> first_chunk;
+	if (!all_chunks.empty()) {
+		first_chunk = std::move(all_chunks[0]);
+		all_chunks.erase(all_chunks.begin());
+	}
 
 	if (first_chunk && first_chunk->size() > 0) {
 		// Check if table exists
@@ -620,6 +643,9 @@ static void StreamMergeFunction(ClientContext &context, TableFunctionInput &data
 			}
 		}
 
+		// Update progress bar
+		state.processed_rows.fetch_add(1);
+
 		return true;  // Continue processing
 	};
 
@@ -631,10 +657,9 @@ static void StreamMergeFunction(ClientContext &context, TableFunctionInput &data
 		}
 	}
 
-	// Process remaining chunks
-	while (continue_processing) {
-		auto chunk = query_result->Fetch();
-		if (!chunk || chunk->size() == 0) break;
+	// Process remaining chunks (already collected)
+	for (auto &chunk : all_chunks) {
+		if (!continue_processing) break;
 		for (idx_t row = 0; row < chunk->size() && continue_processing; row++) {
 			continue_processing = process_row(chunk, row);
 		}
@@ -729,10 +754,32 @@ static void StreamMergeFunction(ClientContext &context, TableFunctionInput &data
 }
 
 //===--------------------------------------------------------------------===//
+// Progress Callback
+//===--------------------------------------------------------------------===//
+
+static double CrawlingMergeProgress(ClientContext &context, const FunctionData *bind_data_p,
+                                   const GlobalTableFunctionState *gstate_p) {
+	if (!gstate_p) {
+		return -1.0;  // Unknown progress
+	}
+
+	auto &gstate = gstate_p->Cast<CrawlingMergeGlobalState>();
+
+	int64_t total = gstate.total_rows.load();
+	int64_t processed = gstate.processed_rows.load();
+
+	if (total <= 0) {
+		return -1.0;  // Still collecting rows
+	}
+
+	return (static_cast<double>(processed) / static_cast<double>(total)) * 100.0;
+}
+
+//===--------------------------------------------------------------------===//
 // Register Function
 //===--------------------------------------------------------------------===//
 
-void RegisterStreamMergeFunction(ExtensionLoader &loader) {
+void RegisterCrawlingMergeFunction(ExtensionLoader &loader) {
 	// Parameters: source_query, source_alias, target_table, join_condition, join_columns,
 	//             has_matched, matched_condition, matched_action, matched_update_by_name,
 	//             has_not_matched, not_matched_insert_by_name,
@@ -747,7 +794,10 @@ void RegisterStreamMergeFunction(ExtensionLoader &loader) {
 	                    LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::BOOLEAN,
 	                    LogicalType::VARCHAR,  // SET clauses as "col=expr;col=expr"
 	                    LogicalType::BIGINT, LogicalType::BIGINT},
-	                   StreamMergeFunction, StreamMergeBind, StreamMergeInitGlobal);
+	                   CrawlingMergeFunction, CrawlingMergeBind, CrawlingMergeInitGlobal);
+
+	// Set progress callback for progress bar integration
+	func.table_scan_progress = CrawlingMergeProgress;
 
 	loader.RegisterFunction(func);
 }

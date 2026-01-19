@@ -10,7 +10,7 @@
 namespace duckdb {
 
 // Single MERGE action (UPDATE, DELETE, or INSERT with optional condition)
-struct StreamMergeAction {
+struct CrawlingMergeAction {
 	MergeActionType action_type = MergeActionType::MERGE_INSERT;
 	unique_ptr<ParsedExpression> condition;  // Optional AND condition
 	InsertColumnOrder column_order = InsertColumnOrder::INSERT_BY_POSITION;
@@ -23,13 +23,13 @@ struct StreamMergeAction {
 	vector<string> insert_columns;
 	vector<unique_ptr<ParsedExpression>> insert_expressions;
 
-	StreamMergeAction() = default;
-	StreamMergeAction(const StreamMergeAction &other);
-	StreamMergeAction &operator=(const StreamMergeAction &other);
+	CrawlingMergeAction() = default;
+	CrawlingMergeAction(const CrawlingMergeAction &other);
+	CrawlingMergeAction &operator=(const CrawlingMergeAction &other);
 };
 
 // Parsed data from CRAWLING MERGE INTO (uses DuckDB's MERGE parser)
-struct StreamMergeParseData : public ParserExtensionParseData {
+struct CrawlingMergeParseData : public ParserExtensionParseData {
 	// Target table (parsed AST)
 	unique_ptr<TableRef> target;
 
@@ -43,7 +43,7 @@ struct StreamMergeParseData : public ParserExtensionParseData {
 	vector<string> using_columns;
 
 	// Actions by condition type (WHEN MATCHED, WHEN NOT MATCHED, etc.)
-	map<MergeActionCondition, vector<StreamMergeAction>> actions;
+	map<MergeActionCondition, vector<CrawlingMergeAction>> actions;
 
 	// Extracted join columns for UPDATE BY NAME exclusion (derived from join_condition)
 	vector<string> join_columns;

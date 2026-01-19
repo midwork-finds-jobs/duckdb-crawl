@@ -88,7 +88,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	RegisterSitemapFunction(loader);
 
 	// Register stream_merge_internal() for STREAM INTO ... USING ... ON (merge) syntax
-	RegisterStreamMergeFunction(loader);
+	RegisterCrawlingMergeFunction(loader);
 
 	// Install signal handler for graceful shutdown (only once)
 	if (!g_signal_handler_installed) {
