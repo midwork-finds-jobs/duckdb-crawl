@@ -4,7 +4,7 @@
 
 require crawler
 
-# Test basic read_html from Wikipedia
+# Test basic read_html from Wikipedia - most expensive buildings
 statement ok
 SELECT * FROM read_html('https://en.wikipedia.org/wiki/List_of_most_expensive_buildings', '#bodyContent table.wikitable.sortable') LIMIT 1;
 
@@ -15,4 +15,35 @@ FROM read_html('https://en.wikipedia.org/wiki/List_of_most_expensive_buildings',
 LIMIT 1;
 ----
 BIGINT
+
+# Test that nominal cost column is VARCHAR (contains $ and text)
+query I
+SELECT typeof("Nominal_cost_$USbillion_")
+FROM read_html('https://en.wikipedia.org/wiki/List_of_most_expensive_buildings', '#bodyContent table.wikitable.sortable')
+LIMIT 1;
+----
+VARCHAR
+
+# Test that inflation-adjusted cost is DOUBLE (numeric)
+query I
+SELECT typeof("Inflation_adjustedcost__2021_$USbillion_")
+FROM read_html('https://en.wikipedia.org/wiki/List_of_most_expensive_buildings', '#bodyContent table.wikitable.sortable')
+LIMIT 1;
+----
+DOUBLE
+
+# Test returns multiple rows
+query I
+SELECT count(*) > 5
+FROM read_html('https://en.wikipedia.org/wiki/List_of_most_expensive_buildings', '#bodyContent table.wikitable.sortable');
+----
+true
+
+# Test Building column exists and has values
+query I
+SELECT count(*) > 0
+FROM read_html('https://en.wikipedia.org/wiki/List_of_most_expensive_buildings', '#bodyContent table.wikitable.sortable')
+WHERE Building IS NOT NULL;
+----
+true
 
